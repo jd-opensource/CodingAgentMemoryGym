@@ -2,7 +2,7 @@
 
 Train language-model agents to use files as memory during long tasks.
 
-[CAMP paper](https://arxiv.org/abs/2609.34422) · [CAMP-II paper](https://arxiv.org/abs/2611.14009) · [CAMP-II project](https://liruiluo.github.io/agentmemorygym-v2/)
+[CAMP paper](https://arxiv.org/abs/2609.34422) · [CAMP project](https://liruiluo.github.io/agentmemorygym/) · [CAMP-II paper](https://arxiv.org/abs/2611.14009) · [CAMP-II project](https://liruiluo.github.io/agentmemorygym-v2/)
 
 This repository brings together **one environment suite, CAMG-II**, and two training methods:
 
