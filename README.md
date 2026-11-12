@@ -2,7 +2,7 @@
 
 Train language-model agents to use files as memory during long tasks.
 
-[CAMP paper](https://arxiv.org/abs/2609.34422) · [CAMP project](https://liruiluo.github.io/agentmemorygym/) · [CAMP-II paper](https://arxiv.org/abs/2611.14009) · [CAMP-II project](https://liruiluo.github.io/agentmemorygym-v2/)
+[CAMP paper](https://arxiv.org/abs/2609.34422) · [CAMP project](https://liruiluo.github.io/agentmemorygym/) · [CAMP-II paper](https://arxiv.org/abs/2611.14009) · [CAMP-II project](https://liruiluo.github.io/agentmemorygym-v2/) · [Dataset](https://huggingface.co/datasets/LiruiLuo/CAMG-II)
 
 This repository brings together **one environment suite, CAMG-II**, and two training methods:
 
@@ -42,7 +42,7 @@ For training, install the [pinned training dependencies](docs/training.md#instal
 
 ## 3. Prepare data and task services
 
-Follow [data preparation](docs/data.md), then [environment setup](docs/environments.md). Downloads come from the original publishers. Dataset, model and container terms remain separate from this repository's code license.
+Download the [CAMG-II dataset](https://huggingface.co/datasets/LiruiLuo/CAMG-II), then follow [data preparation](docs/data.md) and [environment setup](docs/environments.md). The data package includes ordered task definitions, General task files, Coding source data, and ready-made AutoResearch archives. Shop catalog files are fetched directly from their original publisher.
 
 The included `camg/data/train_schedule.jsonl` specifies **12,800 ordered task references**. Download the corresponding task assets with the data-preparation commands. The default recipes run for 100 updates with 64 completed episodes per update.
 

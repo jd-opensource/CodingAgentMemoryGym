@@ -86,10 +86,8 @@ def prepare_coding(args) -> None:
     manifest = json.loads((DATA / "coding/manifest.json").read_text())
     source = args.source
     if args.download:
-        from huggingface_hub import snapshot_download
-        source = Path(snapshot_download("SWE-bench/SWE-smith", repo_type="dataset",
-            revision=manifest["upstream"]["revision"], allow_patterns=["data/*.parquet"],
-            local_dir=args.output / "upstream"))
+        from camg.hub import download_dataset
+        source = download_dataset(args.output / "dataset", "coding", assets_only=True) / "assets/coding"
     if source is None:
         raise ValueError("Supply --source containing the pinned parquet files or --download")
     parquet = sorted(source.rglob("train-*.parquet"))
@@ -156,6 +154,12 @@ def prepare_autoresearch(args) -> None:
     selected = [entry for entry in acquisition if not args.task_id or entry["task_id"] == args.task_id]
     if not selected:
         raise ValueError("Task ID is not in the CAMG-II selection")
+    downloaded_source = None
+    if args.download and (not args.task_id or selected[0]["package"]):
+        from camg.hub import download_dataset
+        root = download_dataset(args.output / "dataset", "autoresearch", assets_only=True,
+            task_id=args.task_id)
+        downloaded_source = root / "assets/autoresearch/archives"
     missing = []
     completed = []
     for entry in selected:
@@ -163,14 +167,10 @@ def prepare_autoresearch(args) -> None:
         record = public[task]
         archive = args.output / record["archive_relpath"]
         supplied = None if args.source is None else args.source / (task + ".tar.zst")
+        if (supplied is None or not supplied.is_file()) and downloaded_source is not None:
+            supplied = downloaded_source / (task + ".tar.zst")
         if supplied is not None and supplied.is_file():
             copy_verified(supplied, archive, entry["required_archive_sha256"])
-        if not archive.exists() and args.download and entry["package"]:
-            package = entry["package"]
-            if len(package["parts"]) != 1:
-                raise ValueError(f"Use the upstream launcher to assemble the multipart archive for {task}")
-            part = package["parts"][0]
-            download(f"{OPENMLE_URL}/{package['artifact_path']}/{part['path']}", archive, entry["required_archive_sha256"])
         if not archive.is_file():
             missing.append({"task_id": task, "required_archive_sha256": entry["required_archive_sha256"],
                 "source": entry["upstream_index_records"]})
@@ -198,12 +198,9 @@ def prepare_mimo(args) -> None:
     rows = [json.loads(line) for line in content.splitlines()]
     if args.environment == "general":
         if args.download:
-            from huggingface_hub import snapshot_download
-            patterns = [f"general/envs/{row['extra_info']['instance_id']}/**" for row in rows]
-            downloaded = Path(snapshot_download("XiaomiMiMo/MiMo-V2.6-RL-oss", repo_type="dataset",
-                revision=source["asset_download_revision"], allow_patterns=patterns,
-                local_dir=args.output / "upstream"))
-            args.source = downloaded / "general/envs"
+            from camg.hub import download_dataset
+            downloaded = download_dataset(args.output / "dataset", "general", assets_only=True)
+            args.source = downloaded / "assets/general/envs"
         if args.source is None:
             raise ValueError("General requires --source pointing to the downloaded general/envs directory, or --download")
         for row in rows:
@@ -228,7 +225,7 @@ def main(argv=None):
     parser.add_argument("--environment", choices=("coding", "autoresearch", "general", "visual"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source", type=Path, help="Already downloaded upstream assets; see docs/data.md")
-    parser.add_argument("--download", action="store_true", help="Download only the selected assets from pinned original sources")
+    parser.add_argument("--download", action="store_true", help="Download the selected assets from the pinned CAMG-II dataset release")
     parser.add_argument("--accept-upstream-terms", action="store_true")
     parser.add_argument("--task-id", help="Prepare one AutoResearch task for installation testing, not a reduced training pool")
     args = parser.parse_args(argv)

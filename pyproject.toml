@@ -19,6 +19,7 @@ data = ["pyarrow>=19", "pandas>=2", "huggingface_hub>=0.34", "zstandard>=0.23"]
 [project.scripts]
 camp-train = "camp.train:main"
 camg-prepare = "camg.prepare:main"
+camg-download = "camg.download:main"
 camg-serve = "camg.serve:main"
 
 [project.urls]
@@ -29,7 +30,7 @@ include = ["camp*", "camg*", "verl*"]
 
 [tool.setuptools.package-data]
 camp = ["configs/*.txt", "configs/*.json", "configs/environments/*.yaml", "configs/environments/*.json"]
-camg = ["data/*.md", "data/*.jsonl", "data/*/*.json", "data/*/*.jsonl", "data/*/*.sha256", "data/*/*.txt", "data/*/*.md", "data/*/instructions/*.md"]
+camg = ["data/*.md", "data/*.json", "data/*.jsonl", "data/*/*.json", "data/*/*.jsonl", "data/*/*.sha256", "data/*/*.txt", "data/*/*.md", "data/*/instructions/*.md"]
 verl = ["version/*", "**/*.yaml", "**/*.json", "py.typed"]
 
 [tool.pytest.ini_options]
