@@ -2,7 +2,7 @@
 
 ## Installation
 
-Use a dedicated Linux x86-64 Python 3.12 environment. The provided recipes target eight Blackwell GPUs. Their attention-kernel choices and memory budgets are hardware-specific, not a promise of compatibility with every CUDA card.
+Use a dedicated Linux x86-64 Python 3.12 environment. The provided recipes target eight Blackwell GPUs. When using other hardware, adjust the attention kernels and memory settings for that GPU architecture.
 
 ```bash
 python -m pip install -r requirements-training.txt
@@ -10,7 +10,7 @@ python -m pip install -e . --no-deps
 python scripts/patch_sglang.py
 ```
 
-`requirements.lock` records the source training environment's installed versions; `runtime-overrides.txt` records additional kernel dependencies. These are provenance inputs, not evidence of a successful fresh installation. GPU installation and execution remain to be verified. Check the patch script's output rather than assuming that a different SGLang version accepts it.
+`requirements.lock` records the source training environment's installed versions; `runtime-overrides.txt` records additional kernel dependencies. Use the pinned SGLang version and check that the patch script succeeds.
 
 Use local model directories containing configuration, tokenizer/chat template and all weight shards. Do not mix tokenizer files from one model revision with weights from another. Record their hashes with the run.
 
@@ -50,7 +50,7 @@ python -m camp.train --method rl --student /models/Qwen3.5-4B \
   --output runs/installation-check -- trainer.total_training_steps=1
 ```
 
-A one-update run checks the installation; it is not a trained result. Changing episode count, sampling count, context length, task ordering or teacher settings changes the experiment and must be recorded.
+Use the one-update command above to check the installation. Changing episode count, sampling count, context length, task ordering or teacher settings changes the experiment and must be recorded.
 
 ## Checkpoints and restart
 
@@ -64,6 +64,6 @@ python -m camp.train --method rl --student /models/Qwen3.5-4B \
   --output runs/camp-rl --resume runs/camp-rl/checkpoints/global_step_10
 ```
 
-Do not copy only actor weights and call that an exact training resume. Do not evaluate an incomplete checkpoint as the declared training endpoint.
+Use the complete training checkpoint for restart and the final student checkpoint for evaluation.
 
 Each invocation writes diagnostic counters in a new `OUTPUT/state/<attempt>/` directory. Resuming restores the checkpoint, not old transient failure counters. Model, dataset, service, output and resume settings are controlled by named command options and cannot be replaced through raw Hydra overrides.

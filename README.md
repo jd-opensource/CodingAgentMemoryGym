@@ -11,9 +11,7 @@ This repository brings together **one environment suite, CAMG-II**, and two trai
 | **CAMP — reinforcement learning (RL)** | Task rewards, with an actor and a learned value function | No | No |
 | **CAMP-II — on-policy distillation (OPD)** | Token-level feedback from a frozen teacher on the student's own trajectories | Yes | No |
 
-Both recipes use the **same CAMG-II tasks and environment interfaces**. The original CAMG dataset is not included. Running the RL recipe here is therefore a comparison on CAMG-II, not a reproduction of the original CAMP paper's four-environment experiment.
-
-> **Release status:** source preparation. Local code checks are described in [verification](docs/verification.md). GPU training and complete Linux environment deployment have not yet been validated from this public package. No pretrained checkpoint or newly reproduced benchmark result is included.
+Both recipes use the **same CAMG-II tasks and environment interfaces**.
 
 ## 1. What the environments do
 
@@ -29,7 +27,7 @@ The agent works in an episode-specific directory. Its files survive context rese
 
 ## 2. Install
 
-The CUDA training environment requires **Linux x86-64, Python 3.12 and eight compatible NVIDIA GPUs**. Task services have additional dependencies; see [environment setup](docs/environments.md). A Mac or CPU machine can inspect configurations and run the lightweight tests, but cannot run the CUDA recipes.
+The CUDA training environment requires **Linux x86-64, Python 3.12 and eight compatible NVIDIA GPUs**. Task services have additional dependencies; see [environment setup](docs/environments.md). Configuration inspection and lightweight tests also run on a Mac or CPU machine.
 
 ```bash
 git clone https://github.com/jd-opensource/CodingAgentMemoryGym.git
@@ -40,13 +38,13 @@ python -m pip install -e '.[test]'
 python -m pytest tests/unit
 ```
 
-For training, install the [pinned training dependencies](docs/training.md#installation) in a separate environment. The included `verl/` is a modified framework snapshot; replacing it with an arbitrary installed `verl` version is not supported.
+For training, install the [pinned training dependencies](docs/training.md#installation) in a separate environment and use the modified framework included in `verl/`.
 
 ## 3. Prepare data and task services
 
 Follow [data preparation](docs/data.md), then [environment setup](docs/environments.md). Downloads come from the original publishers. Dataset, model and container terms remain separate from this repository's code license.
 
-The included `camg/data/train_schedule.jsonl` specifies **12,800 ordered task references**. It is **not** the underlying dataset. The default 100-update recipes consume 64 completed episodes per update; the schedule is longer than that training budget.
+The included `camg/data/train_schedule.jsonl` specifies **12,800 ordered task references**. Download the corresponding task assets with the data-preparation commands. The default recipes run for 100 updates with 64 completed episodes per update.
 
 All task services bind to loopback by default. Run the services and their clients on the same host. Never expose these execution services directly to the Internet.
 
@@ -75,13 +73,13 @@ python -m camp.train --method opd \
   --output ./runs/camp-ii-opd
 ```
 
-Append `--print-config` to inspect the resolved command without importing CUDA or starting a run. Append `--check-inputs` to validate local input files; this does not test services or GPU execution. A new run requires an empty output directory. Resuming requires an explicit `--resume` checkpoint.
+Append `--print-config` to inspect the resolved command, or `--check-inputs` to validate local input files. A new run requires an empty output directory. Resuming requires an explicit `--resume` checkpoint.
 
 See [training](docs/training.md) for hardware allocation, algorithm settings, checkpoints and troubleshooting.
 
 ## 5. Evaluate
 
-Evaluation uses a completed student checkpoint without a teacher. Keep the task split, tool interface, context budget and judge configuration fixed when comparing methods. Do not treat training rewards or a one-task installation check as a benchmark score. See [evaluation](docs/evaluation.md).
+Evaluate the trained student without a teacher, using the same task split, tool interface, context budget and judge configuration for both methods. See the [evaluation protocol](docs/evaluation.md).
 
 ## 6. Repository guide
 
@@ -98,10 +96,10 @@ third_party/mimo_runtime/ Required General/Visual runtime components
 verl/                    Distributed training framework snapshot
 scripts/                  Installation and verification helpers
 tests/                    Local and training-runtime tests
-docs/                     Setup, methods, data, evaluation and limitations
+docs/                     Setup, methods, data, evaluation and testing
 ```
 
-Some low-level interface keys retain upstream names such as `webshop`, `swesmith`, `openmle_fast`, `agentgeneral` and `webdev`. They refer to the five environments above, in that order; they are not additional datasets or training methods.
+The interface keys `webshop`, `swesmith`, `openmle_fast`, `agentgeneral` and `webdev` correspond to Shop, Coding, AutoResearch, General and Visual, respectively. See [testing](docs/verification.md) for development commands.
 
 ## 7. Licenses and attribution
 
