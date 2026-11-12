@@ -1,0 +1,39 @@
+use_dataset_env: true
+
+agent:
+  type: cc-agent
+  tools:
+  - tool: Bash
+    config:
+      timeout: 60
+  system_template: 'You are an agent, your current working directory is {{cwd}}.
+
+
+    You can use the tools available to you to interact with the computer to assist
+    the user in completing tasks.
+
+    '
+  instance_template: '{{task}}
+
+    '
+  step_limit: 500
+  cost_limit: 114514
+  enable_subagents: false
+  enable_skills: false
+  antihack:
+    enabled: true
+    dummy_output: Permission denied. Resource unavailable.
+    dummy_success: false
+    llm_judge_enabled: false
+
+environment:
+  environment_class: recipes.general.general_agent.docker_sidecar.SidecarDockerEnvironment
+  cwd: /work/workspace
+  timeout: 300
+  raise_on_transport_error: true
+  cpu_request: '2'
+  memory_request: 2Gi
+  env:
+    no_proxy: localhost,127.0.0.1,.svc.cluster.local
+    NO_PROXY: localhost,127.0.0.1,.svc.cluster.local
+  node_selector: {}

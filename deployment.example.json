@@ -1,0 +1,24 @@
+{
+  "data_root": "/srv/camg/data",
+  "state_root": "/srv/camg/service-runs/experiment-01",
+  "ripgrep_binary": "/usr/local/bin/rg",
+  "oci_rootfs_cache": "/var/lib/camg/oci-rootfs",
+  "shop": {
+    "source_root": "/srv/camg/upstream/MemoryArena",
+    "items_file": "/srv/camg/data/shop/catalog/items_shuffle.json",
+    "attributes_file": "/srv/camg/data/shop/catalog/items_ins_v2.json",
+    "search_root": "/srv/camg/data/shop/catalog/search_engine",
+    "java_home": "/srv/camg/java11",
+    "product_pool": "/srv/camg/data/shop/product_pool.json"
+  },
+  "coding": {
+    "source_root": "/srv/camg/upstream/SWE-smith",
+    "mirrors_root": "/srv/camg/data/coding/mirrors"
+  },
+  "autoresearch": {
+    "runtime_directory": "/tmp/camg-autoresearch/source"
+  },
+  "mimo": {
+    "agent_environment": "/srv/camg/mcp-agent-venv"
+  }
+}

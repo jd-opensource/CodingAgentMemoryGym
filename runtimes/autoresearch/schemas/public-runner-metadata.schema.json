@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_runner_metadata_v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "contract", "runtime_digest", "formal_eligible",
+    "formal_ineligibility", "kernel_release", "cgroup_version", "cgroup_mode",
+    "cgroup_controller_attestation", "cgroup_v1_cpu", "cgroup_v1_memory",
+    "cgroup_v1_pids", "cgroup_v2_cpu", "cgroup_v2_memory", "cgroup_v2_pids",
+    "cgroup_mounts_exposed_read_only", "cgroup_v1_private_bind_remount",
+    "network_namespace", "network_no_egress", "dns_disabled",
+    "metadata_service_blocked", "external_unix_sockets_blocked", "pid_namespace",
+    "ipc_namespace", "mount_namespace", "user_namespace", "workspace_quota",
+    "tmpfs_limit", "file_size_limit", "open_files_limit",
+    "fresh_unprivileged_uid_gid", "capabilities_dropped", "no_new_privs",
+    "seccomp", "seccomp_contract", "read_only_rootfs", "rootfs_kind",
+    "workspace_noexec", "workspace_storage_contract", "workspace_parent",
+    "instrumented_python_only", "isolated_proc", "minimal_devices",
+    "gpu_devices_absent", "core_dumps_disabled", "mount_denied", "ptrace_denied",
+    "setuid_denied", "user_namespace_creation_denied", "ebpf_denied",
+    "raw_sockets_denied", "kernel_module_denied", "container_engine_absent",
+    "background_process_detection", "descendant_kill_reap",
+    "parent_death_cleanup_watchdog", "freeze_reap", "read_only_workspace_freeze",
+    "teardown_cgroup_empty", "teardown_mount_empty", "idempotent_teardown",
+    "lifecycle_completion_grace_ms", "execution_counter_coverage",
+    "execution_counter_mechanism", "fit_counter_coverage",
+    "cumulative_managed_runtime_budget", "fit_hook_contract",
+    "fit_hook_implementation_contract", "fit_hook_digest", "cleanup_contract",
+    "ownership_contract", "active_verification", "artifact_identity",
+    "resource_limits"
+  ],
+  "properties": {
+    "schema": {"const": "openmle_fast_runner_metadata_v2"},
+    "contract": {"const": "openmle_fast_linux_cgroup_namespace_runner_v1"},
+    "runtime_digest": {"$ref": "#/$defs/runtimeDigest"},
+    "formal_eligible": {"type": "boolean"},
+    "formal_ineligibility": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "kernel_release": {"type": "string", "minLength": 1},
+    "cgroup_version": {"$ref": "#/$defs/cgroupVersion"},
+    "cgroup_mode": {"$ref": "#/$defs/cgroupVersion"},
+    "cgroup_controller_attestation": {"$ref": "#/$defs/controllerAttestation"},
+    "cgroup_v1_cpu": {"type": "boolean"},
+    "cgroup_v1_memory": {"type": "boolean"},
+    "cgroup_v1_pids": {"type": "boolean"},
+    "cgroup_v2_cpu": {"type": "boolean"},
+    "cgroup_v2_memory": {"type": "boolean"},
+    "cgroup_v2_pids": {"type": "boolean"},
+    "cgroup_mounts_exposed_read_only": {"type": "boolean"},
+    "cgroup_v1_private_bind_remount": {"type": "boolean"},
+    "network_namespace": {"type": "boolean"},
+    "network_no_egress": {"type": "boolean"},
+    "dns_disabled": {"type": "boolean"},
+    "metadata_service_blocked": {"type": "boolean"},
+    "external_unix_sockets_blocked": {"type": "boolean"},
+    "pid_namespace": {"type": "boolean"},
+    "ipc_namespace": {"type": "boolean"},
+    "mount_namespace": {"type": "boolean"},
+    "user_namespace": {"type": "boolean"},
+    "workspace_quota": {"type": "boolean"},
+    "tmpfs_limit": {"type": "boolean"},
+    "file_size_limit": {"type": "boolean"},
+    "open_files_limit": {"type": "boolean"},
+    "fresh_unprivileged_uid_gid": {"type": "boolean"},
+    "capabilities_dropped": {"type": "boolean"},
+    "no_new_privs": {"type": "boolean"},
+    "seccomp": {"type": "boolean"},
+    "seccomp_contract": {"const": "openmle_fast_seccomp_deny_sensitive_v1"},
+    "read_only_rootfs": {"type": "boolean"},
+    "rootfs_kind": {"const": "read_only_overlay_over_pinned_oci_lower"},
+    "workspace_noexec": {"type": "boolean"},
+    "workspace_storage_contract": {"const": "owned_dedicated_tmpfs_at_most_2g_v1"},
+    "workspace_parent": {"const": "/tmp/camg-autoresearch/public-workspaces"},
+    "instrumented_python_only": {"type": "boolean"},
+    "isolated_proc": {"type": "boolean"},
+    "minimal_devices": {"type": "boolean"},
+    "gpu_devices_absent": {"type": "boolean"},
+    "core_dumps_disabled": {"type": "boolean"},
+    "mount_denied": {"type": "boolean"},
+    "ptrace_denied": {"type": "boolean"},
+    "setuid_denied": {"type": "boolean"},
+    "user_namespace_creation_denied": {"type": "boolean"},
+    "ebpf_denied": {"type": "boolean"},
+    "raw_sockets_denied": {"type": "boolean"},
+    "kernel_module_denied": {"type": "boolean"},
+    "container_engine_absent": {"type": "boolean"},
+    "background_process_detection": {"type": "boolean"},
+    "descendant_kill_reap": {"type": "boolean"},
+    "parent_death_cleanup_watchdog": {"type": "boolean"},
+    "freeze_reap": {"type": "boolean"},
+    "read_only_workspace_freeze": {"type": "boolean"},
+    "teardown_cgroup_empty": {"type": "boolean"},
+    "teardown_mount_empty": {"type": "boolean"},
+    "idempotent_teardown": {"type": "boolean"},
+    "lifecycle_completion_grace_ms": {"const": 500},
+    "execution_counter_coverage": {"const": "complete"},
+    "execution_counter_mechanism": {"const": "ptrace_exec_lineage_v1"},
+    "fit_counter_coverage": {"const": "partial"},
+    "cumulative_managed_runtime_budget": {"type": "boolean"},
+    "fit_hook_contract": {"const": "openmle_fast_fit_hook_v1"},
+    "fit_hook_implementation_contract": {"const": "openmle_fast_python_profile_fit_hook_v1"},
+    "fit_hook_digest": {"$ref": "#/$defs/sha256"},
+    "cleanup_contract": {"const": "openmle_fast_owned_workspace_cgroup_mount_cleanup_v2"},
+    "ownership_contract": {"const": "openmle_fast_hmac_workspace_identity_state_v1"},
+    "active_verification": {"$ref": "#/$defs/activeVerification"},
+    "artifact_identity": {"$ref": "#/$defs/artifactIdentity"},
+    "resource_limits": {"$ref": "#/$defs/publicLimits"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableSha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "runtimeDigest": {"const": "sha256:ada19e0d27dadb991c5b6112e00f116b26359067d5298650eb2eeff7d8385af2"},
+    "cgroupVersion": {"enum": ["v1", "hybrid", "v2", "unknown"]},
+    "controllerAttestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "controllers", "no_swap_contract"],
+      "properties": {
+        "schema": {"const": "openmle_fast_cgroup_controller_attestation_v1"},
+        "version": {"$ref": "#/$defs/cgroupVersion"},
+        "controllers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory", "pids"],
+          "properties": {
+            "cpu": {"$ref": "#/$defs/cpuController"},
+            "memory": {"$ref": "#/$defs/memoryController"},
+            "pids": {"$ref": "#/$defs/pidsController"}
+          }
+        },
+        "no_swap_contract": {"const": "memory_limit_equals_memsw_limit_and_swappiness_zero"}
+      }
+    },
+    "cpuController": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hierarchy", "required_files", "available"],
+      "properties": {
+        "hierarchy": {"const": "cpu,cpuacct"},
+        "required_files": {"const": ["cpu.cfs_period_us", "cpu.cfs_quota_us", "tasks"]},
+        "available": {"type": "boolean"}
+      }
+    },
+    "memoryController": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hierarchy", "required_files", "available"],
+      "properties": {
+        "hierarchy": {"const": "memory"},
+        "required_files": {"const": ["memory.limit_in_bytes", "memory.memsw.limit_in_bytes", "memory.swappiness", "tasks"]},
+        "available": {"type": "boolean"}
+      }
+    },
+    "pidsController": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hierarchy", "required_files", "available"],
+      "properties": {
+        "hierarchy": {"const": "pids"},
+        "required_files": {"const": ["pids.max", "tasks"]},
+        "available": {"type": "boolean"}
+      }
+    },
+    "rootfsIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "path", "runtime_digest", "tree_lock_sha256", "tree_lock", "tree_measurement", "root_stat", "sidecar_sha256", "critical_file_sha256", "metadata_contract", "valid"],
+      "properties": {
+        "schema": {"const": "openmle_fast_rootfs_identity_v2"},
+        "path": {"type": "string", "minLength": 1},
+        "runtime_digest": {"$ref": "#/$defs/runtimeDigest"},
+        "tree_lock_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "tree_lock": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["schema", "runtime_digest", "algorithm", "tree_sha256", "python_path", "python_sha256", "regular_files", "bytes", "status"],
+          "properties": {
+            "schema": {"const": "openmle_fast_rootfs_tree_lock_v2"},
+            "runtime_digest": {"$ref": "#/$defs/runtimeDigest"},
+            "algorithm": {"const": "sha256_path_type_mode_uid_gid_nlink_size_content_v1"},
+            "tree_sha256": {"$ref": "#/$defs/nullableSha256"},
+            "python_path": {"const": "/opt/miniconda3/envs/testbed/bin/python3.10"},
+            "python_sha256": {"$ref": "#/$defs/nullableSha256"},
+            "regular_files": {"type": "integer", "minimum": 0},
+            "bytes": {"type": "integer", "minimum": 0},
+            "status": {"type": "string", "minLength": 1}
+          }
+        },
+        "tree_measurement": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["schema", "algorithm", "tree_sha256", "python_path", "python_sha256", "regular_files", "bytes"],
+          "properties": {
+            "schema": {"const": "openmle_fast_rootfs_tree_measurement_v1"},
+            "algorithm": {"const": "sha256_path_type_mode_uid_gid_nlink_size_content_v1"},
+            "tree_sha256": {"$ref": "#/$defs/sha256"},
+            "python_path": {"const": "/opt/miniconda3/envs/testbed/bin/python3.10"},
+            "python_sha256": {"$ref": "#/$defs/sha256"},
+            "regular_files": {"type": "integer", "minimum": 1},
+            "bytes": {"type": "integer", "minimum": 1}
+          }
+        },
+        "root_stat": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["device", "inode", "mode", "uid", "gid", "mtime_ns", "ctime_ns"],
+          "properties": {
+            "device": {"type": "integer", "minimum": 0}, "inode": {"type": "integer", "minimum": 1},
+            "mode": {"type": "integer", "minimum": 0}, "uid": {"type": "integer", "minimum": 0},
+            "gid": {"type": "integer", "minimum": 0}, "mtime_ns": {"type": "integer", "minimum": 0},
+            "ctime_ns": {"type": "integer", "minimum": 0}
+          }
+        },
+        "sidecar_sha256": {
+          "type": "object", "additionalProperties": false,
+          "required": [".complete", "metadata.json", "manifest.json", "config.json"],
+          "properties": {
+            ".complete": {"$ref": "#/$defs/nullableSha256"}, "metadata.json": {"$ref": "#/$defs/nullableSha256"},
+            "manifest.json": {"$ref": "#/$defs/nullableSha256"}, "config.json": {"$ref": "#/$defs/nullableSha256"}
+          }
+        },
+        "critical_file_sha256": {
+          "type": "object", "additionalProperties": false,
+          "required": ["bash", "python"],
+          "properties": {"bash": {"$ref": "#/$defs/nullableSha256"}, "python": {"$ref": "#/$defs/nullableSha256"}}
+        },
+        "metadata_contract": {
+          "type": "object", "additionalProperties": false,
+          "required": ["resolved_digest", "manifest_sha256", "config_sha256", "bash_sha256", "regular_files", "bytes"],
+          "properties": {
+            "resolved_digest": {"type": ["string", "null"]}, "manifest_sha256": {"$ref": "#/$defs/nullableSha256"},
+            "config_sha256": {"$ref": "#/$defs/nullableSha256"}, "bash_sha256": {"$ref": "#/$defs/nullableSha256"},
+            "regular_files": {"type": ["integer", "null"], "minimum": 0}, "bytes": {"type": ["integer", "null"], "minimum": 0}
+          }
+        },
+        "valid": {"type": "boolean"}
+      }
+    },
+    "activeChecks": {
+      "type": "object", "additionalProperties": false,
+      "required": ["linux", "x86_64", "root_identity", "cgroup_v1_or_hybrid", "cpu_controller", "memory_controller", "pids_controller", "rootfs_identity", "supervisor", "python_wrapper", "fit_hook", "mount_tool", "unshare_tool", "artifact_lock", "artifact_install_inventory"],
+      "properties": {
+        "linux": {"type": "boolean"}, "x86_64": {"type": "boolean"}, "root_identity": {"type": "boolean"},
+        "cgroup_v1_or_hybrid": {"type": "boolean"}, "cpu_controller": {"type": "boolean"},
+        "memory_controller": {"type": "boolean"}, "pids_controller": {"type": "boolean"},
+        "rootfs_identity": {"type": "boolean"}, "supervisor": {"type": "boolean"},
+        "python_wrapper": {"type": "boolean"}, "fit_hook": {"type": "boolean"},
+        "mount_tool": {"type": "boolean"}, "unshare_tool": {"type": "boolean"},
+        "artifact_lock": {"type": "boolean"}, "artifact_install_inventory": {"type": "boolean"}
+      }
+    },
+    "activeVerification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "checks", "all_checks_pass", "admission_stamp_valid", "admission_stamp_digest", "boot_id", "rootfs_identity"],
+      "properties": {
+        "schema": {"const": "openmle_fast_active_runtime_preflight_v1"},
+        "checks": {"$ref": "#/$defs/activeChecks"}, "all_checks_pass": {"type": "boolean"},
+        "admission_stamp_valid": {"type": "boolean"}, "admission_stamp_digest": {"$ref": "#/$defs/nullableSha256"},
+        "boot_id": {"type": "string", "minLength": 1}, "rootfs_identity": {"$ref": "#/$defs/rootfsIdentity"}
+      }
+    },
+    "artifactIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["supervisor_sha256", "python_wrapper_sha256", "fit_hook_sha256", "artifact_lock_sha256", "artifact_lock_expected_sha256", "rootfs_tree_lock_sha256", "verification_wrapper_sha256", "install_bundle_sha256", "remote_cleanup_sha256", "build_bundle_sha256", "public_runner_sha256", "private_runner_sha256"],
+      "properties": {
+        "supervisor_sha256": {"$ref": "#/$defs/nullableSha256"}, "python_wrapper_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "fit_hook_sha256": {"$ref": "#/$defs/nullableSha256"}, "artifact_lock_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "artifact_lock_expected_sha256": {"$ref": "#/$defs/nullableSha256"}, "rootfs_tree_lock_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "verification_wrapper_sha256": {"$ref": "#/$defs/nullableSha256"}, "install_bundle_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "remote_cleanup_sha256": {"$ref": "#/$defs/nullableSha256"}, "build_bundle_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "public_runner_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "private_runner_sha256": {"$ref": "#/$defs/nullableSha256"}
+      }
+    },
+    "publicLimits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_policy_actions", "cpu_vcpus", "memory_bytes", "swap_bytes", "workspace_bytes", "tmp_bytes", "max_processes", "max_open_files", "max_files", "max_file_bytes", "max_submission_bytes", "shell_wall_ms", "managed_runtime_per_action_ms", "managed_runtime_per_episode_ms", "episode_wall_ms", "grader_cpu_vcpus", "grader_memory_bytes", "grader_max_processes", "grader_worker_wall_ms", "grader_total_wall_ms", "grader_max_concurrent_requests", "grader_input_bytes", "raw_output_bytes", "observation_bytes", "observation_head_bytes", "observation_tail_bytes"],
+      "properties": {
+        "max_policy_actions": {"const": 200}, "cpu_vcpus": {"const": 2}, "memory_bytes": {"const": 4294967296},
+        "swap_bytes": {"const": 0}, "workspace_bytes": {"const": 2147483648}, "tmp_bytes": {"const": 268435456},
+        "max_processes": {"const": 64}, "max_open_files": {"const": 256}, "max_files": {"const": 100000},
+        "max_file_bytes": {"const": 268435456}, "max_submission_bytes": {"const": 67108864},
+        "shell_wall_ms": {"const": 20000}, "managed_runtime_per_action_ms": {"const": 15000},
+        "managed_runtime_per_episode_ms": {"const": 120000}, "episode_wall_ms": {"const": 180000},
+        "grader_cpu_vcpus": {"const": 1}, "grader_memory_bytes": {"const": 2147483648},
+        "grader_max_processes": {"const": 32}, "grader_worker_wall_ms": {"const": 7000},
+        "grader_total_wall_ms": {"const": 7500}, "grader_max_concurrent_requests": {"const": 8},
+        "grader_input_bytes": {"const": 67108864}, "raw_output_bytes": {"const": 8388608},
+        "observation_bytes": {"const": 65536}, "observation_head_bytes": {"const": 32768},
+        "observation_tail_bytes": {"const": 32768}
+      }
+    }
+  }
+}

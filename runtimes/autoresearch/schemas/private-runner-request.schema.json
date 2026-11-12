@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_private_runner_request_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "task_id", "grader_binding_sha256", "package_identity_sha256",
+    "metric_sha256", "answer_sha256", "submission_sha256",
+    "higher_is_better", "validator_success_forms", "metric_fd", "answer_fd",
+    "submission_fd", "timeout_ms"
+  ],
+  "properties": {
+    "schema": {"const": "openmle_fast_private_runner_request_v1"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "grader_binding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "package_identity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "metric_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "answer_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "submission_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "higher_is_better": {"type": "boolean"},
+    "validator_success_forms": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 256}},
+    "metric_fd": {"type": "integer", "minimum": 3},
+    "answer_fd": {"type": "integer", "minimum": 3},
+    "submission_fd": {"type": "integer", "minimum": 3},
+    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 7000}
+  }
+}

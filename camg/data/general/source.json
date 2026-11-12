@@ -1,0 +1,8 @@
+{
+  "source": "https://huggingface.co/datasets/XiaomiMiMo/MiMo-V2.6-RL-oss",
+  "asset_download_revision": "e8e81e4945270b6212204bad99de1e598f7fb077",
+  "license": "Apache-2.0",
+  "rows": 925,
+  "sha256": "ad0fb6b76a8ee0be1fdfb4020e35e7b2b4997d097e7fe6131d2255804fb7a45a",
+  "changes": "Preserved selected row order, prompts, task identities and tool data; replaced machine-specific asset paths and serialized as JSONL. Asset revision is the publicly available preparation pin, not a verified historical container snapshot."
+}

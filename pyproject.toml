@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coding-agent-memory-gym"
+version = "0.1.0"
+description = "File-memory environments and reinforcement learning / on-policy distillation for long-horizon agents"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0 AND MIT AND CC-BY-NC-4.0"
+license-files = ["LICENSE", "licenses/*.txt", "camg/data/autoresearch/OpenMLE-LICENSE.txt"]
+dependencies = ["requests>=2.31", "numpy>=1.26"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "PyYAML>=6", "pydantic>=2", "fastapi>=0.115", "httpx>=0.27", "unidiff>=0.7", "zstandard>=0.23", "pyarrow>=19"]
+data = ["pyarrow>=19", "pandas>=2", "huggingface_hub>=0.34", "zstandard>=0.23"]
+
+[project.scripts]
+camp-train = "camp.train:main"
+camg-prepare = "camg.prepare:main"
+camg-serve = "camg.serve:main"
+
+[project.urls]
+Repository = "https://github.com/jd-opensource/CodingAgentMemoryGym"
+
+[tool.setuptools.packages.find]
+include = ["camp*", "camg*", "verl*"]
+
+[tool.setuptools.package-data]
+camp = ["configs/*.txt", "configs/*.json", "configs/environments/*.yaml", "configs/environments/*.json"]
+camg = ["data/*.md", "data/*.jsonl", "data/*/*.json", "data/*/*.jsonl", "data/*/*.sha256", "data/*/*.txt", "data/*/*.md", "data/*/instructions/*.md"]
+verl = ["version/*", "**/*.yaml", "**/*.json", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["training: requires the full Linux/CUDA training environment"]
+

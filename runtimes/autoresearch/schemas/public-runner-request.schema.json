@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_runner_request_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "workspace", "command", "timeout_ms", "managed_runtime_budget_ms"],
+  "properties": {
+    "schema": {"const": "openmle_fast_runner_request_v1"},
+    "workspace": {"type": "string", "pattern": "^/", "minLength": 2},
+    "command": {"type": "string", "maxLength": 32768},
+    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 20000},
+    "managed_runtime_budget_ms": {"type": "integer", "minimum": 1, "maximum": 15000}
+  }
+}

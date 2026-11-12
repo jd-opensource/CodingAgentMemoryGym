@@ -1,0 +1,91 @@
+{
+  "agent_name": "amg_task_neutral_async",
+  "routes": [
+    {
+      "client": {
+        "env_addr": "http://127.0.0.1:65131",
+        "max_retries": 1,
+        "policy_system_prompt": "You are operating a programmatically generated AgentMemoryGym WebShop task with six shopping sessions and a private persistent workspace. Every policy response must contain at least one complete Qwen XML envelope. When several independent calls are useful together, emit them as consecutive envelopes in the same response; the environment executes them in order. Reason inside think tags before the envelopes, and output nothing after the last envelope closes. Do not use Markdown fences, bare JSON, or bare tool syntax, and never write envelope syntax inside your reasoning or your think blocks.\nWorkspace bash takes exactly one parameter: command. Never add workdir or timeout_ms parameters; every command already runs from the workspace root, so use workspace-relative paths and no cd.\nPut multi-line file content in one quoted here-document: append with `cat >> path <<'EOF'` and overwrite with `cat > path <<'EOF'`, placing every pending line in the same block instead of one line per call. Do not assemble multi-line text with inline printf or echo arguments.\nChaining with `&&` or `||` inside one command is allowed; prefer write-then-read-back verification, for example `echo '+Confirmed field: value' >> notes.md && cat notes.md`.\n\nThe WebShop backend exposes only the `search` and `click` functions through the complete Qwen XML envelope above. Use the search function with exactly one non-empty keywords string. Use the click function with exactly one non-empty item string copied from a currently clickable value; calling click with item `Buy Now` commits the current product. A failed purchase ends the episode without revealing the expected answer.\n\nSearch example:\n<tool_call>\n<function=search>\n<parameter=keywords>wireless headphones</parameter>\n</function>\n</tool_call>\n\nClick example:\n<tool_call>\n<function=click>\n<parameter=item>Buy Now</parameter>\n</function>\n</tool_call>\n\nWorkspace shell example:\n<tool_call>\n<function=bash>\n<parameter=command>cat .agent_memory/notes.md</parameter>\n</function>\n</tool_call>\n\nWorkspace Add File example:\n<tool_call>\n<function=bash>\n<parameter=command>cat >> .agent_memory/notes.md <<'EOF'\nConfirmed example attribute: example value\nConfirmed example attribute: second value\nEOF</parameter>\n</function>\n</tool_call>\nWhen a task says Add File, append the note with a quoted here-document in one bash call; when several notes are pending, put all their lines in the same here-document. For an actual shopping note, use the exact full `Confirmed <field>: <value>` line from the selected approved card; a product title is not a field/value note.\n\nFor example, a search and a workspace read as two independent calls in one response:\n<tool_call>\n<function=search>\n<parameter=keywords>wireless headphones</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>cat .agent_memory/notes.md</parameter>\n</function>\n</tool_call>\n\nThe workspace persists across shopping sessions within this episode and is reset between episodes. The shell is networkless and resource-bounded; paths stay inside the workspace. Workspace actions have zero task reward and are optional outside a context boundary. At each shopping-session boundary, use one normal XML bash function call to overwrite `.agent_memory/CONTINUATION.md`; only a verified non-empty write lets the wrapper remove old messages. Then read that file through one normal XML bash call in the new context.\n\nWorkspace checkpoint example (overwrite the handoff slot, then read it back in the new context):\n<tool_call>\n<function=bash>\n<parameter=command>mkdir -p .agent_memory && cat > .agent_memory/CONTINUATION.md <<'EOF'\nworking-state summary and locators for longer-lived note files\nEOF</parameter>\n</function>\n</tool_call>\n\nOther workspace files remain available for voluntary notes. There is no host-path access or dedicated memory API. `.agent_memory/CONTINUATION.md` is a single-boundary handoff slot, not cumulative memory. Every later context boundary overwrites this same file. Store evidence that must survive multiple context boundaries in other ordinary workspace files before the boundary, and list those paths in the checkpoint.\n\nThe whole episode - all six shopping sessions together - shares one fixed budget of 42 policy rounds, and each observation carries a footer of the form [Shop round budget: round N of 42; R rounds remain.]. Rounds spent in early sessions are unavailable to later ones, and an episode that runs out of rounds before completing the final session's purchase ends without that purchase: once a session's required product is identified, complete its purchase instead of continuing to browse or take notes.\n\nInitial-action contract: when Progress is 0/6 and the observation lists approved cards but no search-result page, the next function must be search with one approved full product title. Never call click with item `search`; click items must be copied from currently displayed clickable values.",
+        "task_name": "agentmemory",
+        "timeout": 600
+      },
+      "max_observation_tokens": 8192,
+      "max_rounds": 64,
+      "policy_framing_sha256": "cb77f939e67552e9bf6540388bcb39392b5e493222a485aa79764fe25b0ea21b",
+      "route_attestation_sha256": "1999ac7c69b057e7b7b89acc27ab6add6b08944992f3a6106b526b2120e440d8",
+      "route_id": "webshop"
+    },
+    {
+      "client": {
+        "checkpoint_contract_penalty": -0.1,
+        "env_addr": "http://127.0.0.1:65134",
+        "invalid_action_reward": 0.0,
+        "max_retries": 2,
+        "task_name": "swesmith",
+        "timeout": 900
+      },
+      "max_observation_tokens": 8192,
+      "max_rounds": 64,
+      "policy_framing_sha256": "6ee90454529bae5d23923a662e3895770cbbcd2c798d6a7738a99faf05b1cbea",
+      "route_attestation_sha256": "9d04b75869522893a1b88fac16daf7407aa62deb6104655d895e922610729fe9",
+      "route_id": "swesmith"
+    },
+    {
+      "client": {
+        "env_addr": "http://127.0.0.1:65133",
+        "expected_actions_sha256": "90198be7b4799b62509a7ba0d2b3c74dc9a2d9fc7c1a6118ebc4d840700d93cb",
+        "expected_executor_runtime_digest": "sha256:ada19e0d27dadb991c5b6112e00f116b26359067d5298650eb2eeff7d8385af2",
+        "expected_inner_commit": "ed3107e6d07e8cfaebd36411328c2402a3bb4a72",
+        "expected_manifest_sha256": "2beb486ea3127ce4a2fc56c9074f44630ed5c41727a8d4a4b0e4775edc7c57c3",
+        "expected_materializer_sha256": "43d496ba454acfcc5516fdea6e934b12e84d4e945c23764fd4cc4a2d16262672",
+        "expected_max_observation_tokens": 8192,
+        "expected_outer_commit": "c301badf2e373bf267f745fdbc5e1280f268c6e7",
+        "expected_release_revision": "f56e4b31252a9b81d95fea100098cd49b7290398",
+        "expected_role": "train_pool",
+        "max_retries": 2,
+        "task_name": "openmle_fast",
+        "timeout": 3660
+      },
+      "max_observation_tokens": 8192,
+      "max_rounds": 64,
+      "policy_framing_sha256": "563a06ca900ddd86cbc64eaf9385ce8909ce9e1b96164ab633ea41b92f42e100",
+      "route_attestation_sha256": "3784fad5c6a73737f4f5260344c4ddea7ee9c230461e495ce798f6b9284e3aef",
+      "route_id": "openmle_fast"
+    },
+    {
+      "client": {
+        "env_addr": "http://127.0.0.1:65139",
+        "expected_inner_commit": "02466fc338aceb056d36c80d06a4be4185390bdb",
+        "expected_max_observation_tokens": 12288,
+        "expected_outer_commit": "7138e4fbb5931c3a5bea1ebec60338e2a63ad469",
+        "expected_role": "train_pool",
+        "max_retries": 2,
+        "task_name": "agentgeneral",
+        "timeout": 900
+      },
+      "max_observation_tokens": 12288,
+      "max_rounds": 64,
+      "policy_framing_sha256": "6744947bb2261e93dde698e480e2dc63011919ea7e930267437b5ea7d0802de4",
+      "route_attestation_sha256": "f6466309fd3344e85aa8865ff3d8c68360b3f85eb33feaf6780f1c5fcde077ef",
+      "route_id": "agentgeneral"
+    },
+    {
+      "client": {
+        "env_addr": "http://127.0.0.1:65140",
+        "expected_inner_commit": "02466fc338aceb056d36c80d06a4be4185390bdb",
+        "expected_max_observation_tokens": 12288,
+        "expected_outer_commit": "7138e4fbb5931c3a5bea1ebec60338e2a63ad469",
+        "expected_role": "train_pool",
+        "max_retries": 2,
+        "task_name": "webdev",
+        "timeout": 900
+      },
+      "max_observation_tokens": 12288,
+      "max_rounds": 64,
+      "policy_framing_sha256": "55a6e625de867d2fb0fbcda236b15d20e09f63638d375fdd1ce9aa88a231e122",
+      "route_attestation_sha256": "a0c0d2aa8138d881b0fb6893bd00bd400138fe8afad61a8bb04d324f24c158f5",
+      "route_id": "webdev"
+    }
+  ],
+  "schema": "amg_route_registry_v1"
+}

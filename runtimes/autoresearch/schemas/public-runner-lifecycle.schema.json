@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_backend_lifecycle_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "operation", "success", "processes_reaped",
+    "workspace_read_only", "cgroup_empty", "failure_class"
+  ],
+  "properties": {
+    "schema": {"const": "openmle_fast_backend_lifecycle_v1"},
+    "operation": {"enum": ["freeze", "teardown"]},
+    "success": {"type": "boolean"},
+    "processes_reaped": {"type": "boolean"},
+    "workspace_read_only": {"type": "boolean"},
+    "cgroup_empty": {"type": "boolean"},
+    "failure_class": {"type": ["string", "null"]}
+  }
+}

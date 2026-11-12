@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_runner_receipt_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "stdout_b64", "stderr_b64", "exit_code", "timed_out",
+    "wall_seconds", "managed_runtime_wall_seconds", "cpu_seconds",
+    "peak_rss_bytes", "bytes_read", "bytes_written", "process_peak",
+    "execution_attempt_delta", "execution_completed_delta",
+    "nested_subprocess_delta", "fit_delta", "fit_counter_coverage",
+    "failure_class", "infrastructure_fault"
+  ],
+  "properties": {
+    "schema": {"const": "openmle_fast_runner_receipt_v1"},
+    "stdout_b64": {"type": "string"},
+    "stderr_b64": {"type": "string"},
+    "exit_code": {"type": ["integer", "null"]},
+    "timed_out": {"type": "boolean"},
+    "wall_seconds": {"type": "number", "minimum": 0},
+    "managed_runtime_wall_seconds": {"type": "number", "minimum": 0},
+    "cpu_seconds": {"type": "number", "minimum": 0},
+    "peak_rss_bytes": {"type": "integer", "minimum": 0},
+    "bytes_read": {"type": "integer", "minimum": 0},
+    "bytes_written": {"type": "integer", "minimum": 0},
+    "process_peak": {"type": "integer", "minimum": 0},
+    "execution_attempt_delta": {"type": "integer", "minimum": 0},
+    "execution_completed_delta": {"type": "integer", "minimum": 0},
+    "nested_subprocess_delta": {"type": "integer", "minimum": 0},
+    "fit_delta": {"type": "integer", "minimum": 0},
+    "fit_counter_coverage": {"enum": ["complete", "partial"]},
+    "failure_class": {"type": ["string", "null"]},
+    "infrastructure_fault": {"type": "boolean"}
+  }
+}

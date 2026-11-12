@@ -1,0 +1,4305 @@
+from __future__ import annotations
+
+import ast
+from copy import deepcopy
+import hashlib
+import json
+import math
+import re
+from typing import Any, Mapping, Sequence
+
+import requests
+
+from camg.controller import (BaseAdapter, BaseEnvClient, extract_python_code_blocks, format_code_as_action_prompt, format_function_call_prompt, parse_python_code_comments)
+from camg.controller.types import (
+    PolicyContextCapacityExceeded,
+    ActionFormat,
+    ActionWithTought,
+    CONTEXT_OPERATION_APPEND,
+    CONTEXT_OPERATION_PRESERVE,
+    CONTEXT_OPERATION_REPLACE,
+    ConversationMessage,
+    PolicyContextPressure,
+    StepOutput,
+    build_task_neutral_context_transition,
+    build_task_neutral_transition_info,
+)
+from .filesystem_checkpoint import (
+    FILESYSTEM_CHECKPOINT_LONG_LIVED_MEMORY_NOTICE,
+    FILESYSTEM_CHECKPOINT_MAX_BYTES,
+    FILESYSTEM_CHECKPOINT_PATH,
+    build_filesystem_checkpoint_read_retry_observation,
+    build_filesystem_checkpoint_read_receipt,
+    build_filesystem_checkpoint_receipt,
+    build_filesystem_checkpoint_retry_observation,
+    build_filesystem_checkpoint_write_retry_context,
+    build_post_checkpoint_context,
+    build_post_checkpoint_read_retry_context,
+    checkpoint_retry_ceiling_tokens,
+    checkpoint_retry_trigger_tokens,
+    filesystem_checkpoint_action_completed,
+    filesystem_checkpoint_failure_reason,
+    filesystem_checkpoint_framing_sha256,
+    filesystem_checkpoint_read_observed,
+    filesystem_checkpoint_read_failure_reason,
+    filesystem_checkpoint_read_matches,
+    filesystem_workspace_action_request_sha256,
+    filesystem_checkpoint_write_succeeded,
+)
+from .webshop_handoff import (
+    WEBSHOP_CONTEXT_COMPACTION_REQUEST,
+    WEBSHOP_POLICY_CONTINUATION_MARKER,
+    WEBSHOP_POST_CHECKPOINT_READ_MARKER,
+    WEBSHOP_REPEATED_CHECKPOINT_READ_MARKER,
+    WEBSHOP_SESSION_HANDOFF_REQUEST,
+)
+from .verl_qwen_tool_parser import (
+    QWEN_INVALID_ACTION_SENTINEL,
+    QWEN_SINGLE_TOOL_CALL_CONTRACT,
+    WORKSPACE_SHELL_CONTRACT,
+    WORKSPACE_SHELL_CONTRACT,
+    WORKSPACE_SHELL_CONTRACT,
+    WORKSPACE_SHELL_CONTRACT,
+    WORKSPACE_SHELL_CONTRACT,
+    describe_inert_qwen_function_record,
+    parse_single_qwen3_tool_call,
+)
+
+AGENTMEMORY_FUNCTION_DESCRIPTION = [
+    {
+        "name": "search",
+        "description": "Use the original WebShop search bar with policy-chosen keywords.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keywords": {"type": "string", "description": "WebShop search keywords."},
+            },
+            "required": ["keywords"],
+        },
+    },
+    {
+        "name": "click",
+        "description": "Click one value currently exposed by the original WebShop page.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "Current clickable value."},
+            },
+            "required": ["item"],
+        },
+    },
+    {
+        "name": "add",
+        "description": "Store exactly the provided key and value in hidden long-term memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Memory key."},
+                "value": {"type": "string", "description": "Memory value."},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "update",
+        "description": "Update an existing long-term memory by memory_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "Memory id such as mem_0000."},
+                "key": {"type": "string", "description": "Optional replacement memory key."},
+                "value": {"type": "string", "description": "New memory value."},
+            },
+            "required": ["memory_id", "value"],
+        },
+    },
+    {
+        "name": "delete",
+        "description": "Delete an obsolete or wrong long-term memory by memory_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "Memory id such as mem_0000."},
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "retrieve",
+        "description": "Match a query against text previously stored with add and expose matching memories as active context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Retrieval query."},
+                "top_k": {"type": "integer", "description": "Number of memories to retrieve."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "summary",
+        "description": "Replace active context with policy-authored text grounded in visible context IDs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Summary text."},
+                "source_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Visible S*/C* context IDs used for the summary.",
+                },
+            },
+            "required": ["text", "source_ids"],
+        },
+    },
+    {
+        "name": "filter",
+        "description": "Keep or drop already visible short-term context IDs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keep_ids": {"type": "array", "items": {"type": "string"}, "description": "Context IDs to keep, such as C0 or S0."},
+                "drop_ids": {"type": "array", "items": {"type": "string"}, "description": "Context IDs to drop, such as C0 or S0."},
+                "scope": {"type": "string", "description": "active, session, or all."},
+            },
+        },
+    },
+]
+
+AGENTMEMORY_FILESYSTEM_FUNCTION_DESCRIPTION = [
+    *AGENTMEMORY_FUNCTION_DESCRIPTION[:2],
+    {
+        "name": "bash",
+        "description": (
+            "Run one shell command inside the private, networkless, "
+            "resource-bounded episode workspace."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute.",
+                },
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+AGENTMEMORY_ASK_FUNCTION_DESCRIPTION = {
+    "name": "ask",
+    "description": (
+        "Ask once for the single clarification field exposed by the current "
+        "intent-clarification task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "description": "The ambiguity-resolving field named by the task.",
+            },
+        },
+        "required": ["field"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _openai_function_schema(function: Mapping[str, Any]) -> dict[str, Any]:
+    return {"type": "function", "function": dict(function)}
+
+
+_WEBSHOP_QWEN_TOOL_SCHEMAS = tuple(
+    _openai_function_schema(function)
+    for function in AGENTMEMORY_FILESYSTEM_FUNCTION_DESCRIPTION
+)
+_WEBSHOP_QWEN_ASK_TOOL_SCHEMA = _openai_function_schema(
+    AGENTMEMORY_ASK_FUNCTION_DESCRIPTION
+)
+
+FUNCTION_TO_ACTION = {
+    "search": "search",
+    "click": "click",
+    "add": "ADD",
+    "update": "UPDATE",
+    "delete": "DELETE",
+    "retrieve": "RETRIEVE",
+    "summary": "SUMMARY",
+    "filter": "FILTER",
+    "ask": "ASK",
+}
+FILESYSTEM_FUNCTION_TO_ACTION = {
+    "search": "search",
+    "click": "click",
+    "bash": "bash",
+}
+
+MEMORY_ACTION_NAMES = ("ADD", "UPDATE", "DELETE", "RETRIEVE", "SUMMARY", "FILTER")
+CLARIFICATION_ACTION_NAMES = ("ASK",)
+NATIVE_ACTION_NAMES = ("search", "click")
+JSON_ACTION_NAMES = (*MEMORY_ACTION_NAMES, *CLARIFICATION_ACTION_NAMES)
+ACTION_NAMES = (*NATIVE_ACTION_NAMES, *JSON_ACTION_NAMES)
+
+
+WEBSHOP_MAX_ROUND_TIMEOUT_FAILURE = -0.01
+NATIVE_ACTION_PREFIX_RE = re.compile(r"\A(search|click)\[")
+
+
+def _parse_native_bracket_action(text: str) -> tuple[str, str] | None:
+
+
+    if "\n" in text or "\r" in text:
+        return None
+    prefix = NATIVE_ACTION_PREFIX_RE.match(text)
+    if prefix is None:
+        return None
+    depth = 1
+    argument_start = prefix.end()
+    for index in range(argument_start, len(text)):
+        char = text[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                if index != len(text) - 1:
+                    return None
+                return prefix.group(1), text[argument_start:index].strip()
+            if depth < 0:
+                return None
+    return None
+
+
+JSON_ACTION_RE = re.compile(
+    r"\A(" + "|".join(JSON_ACTION_NAMES) + r")\s+(\{.*\})\Z",
+    flags=re.DOTALL,
+)
+FILESYSTEM_ACTION_NAMES = ("bash",)
+FILESYSTEM_JSON_ACTION_RE = re.compile(
+    r"\Abash\s+(\{.*\})\Z",
+    flags=re.DOTALL,
+)
+FILESYSTEM_ASK_ACTION_RE = re.compile(
+    r"\AASK\s+(\{.*\})\Z",
+    flags=re.DOTALL,
+)
+FILESYSTEM_APPLY_PATCH_PREFIX = "apply_patch\n"
+QWEN_WORKSPACE_TOOL_CALL_RE = re.compile(
+    r"\A<tool_call>\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*</tool_call>\Z",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+QWEN_WORKSPACE_PARAMETER_RE = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+_WEBSHOP_LEGACY_AVAILABLE_ACTIONS_RE = re.compile(
+    r"(?m)^Native WebShop actions currently available:\n"
+    r"(?P<actions>(?:- (?:search|click)\[[^\n]*\]\n?)+)"
+)
+_WEBSHOP_QWEN_AVAILABLE_FUNCTIONS_RE = re.compile(
+    r"(?m)^Native WebShop functions currently available through Qwen XML:\n"
+    r"(?P<actions>(?:- `(?:search|click)` function;[^\n]*\n?)+)"
+)
+_WEBSHOP_LEGACY_INVALID_ACTION = (
+    "Invalid action: Expected one native search[...] / click[...] action, or one "
+    "canonical workspace action: bash {JSON} with the literal prefix "
+    "and one space. Bare JSON, "
+    "markdown code fences, and explanations are invalid."
+)
+_WEBSHOP_QWEN_INVALID_ACTION = (
+    "Invalid action: expected a complete Qwen XML function call for "
+    "an available `search`, `click`, or `bash` function. "
+    "Bare JSON, endpoint-native syntax, Markdown code fences, and explanations "
+    "are invalid."
+)
+_WEBSHOP_LEGACY_INVALID_ACTION_RE = re.compile(
+    rf"(?m)^(?P<prefix>(?:Result:\s*)?){re.escape(_WEBSHOP_LEGACY_INVALID_ACTION)}$"
+)
+_WEBSHOP_INLINE_SHELL_ACTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])bash\s+(?=\{)", flags=re.IGNORECASE
+)
+_WEBSHOP_INLINE_ASK_ACTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])ask\s+(?=\{)", flags=re.IGNORECASE
+)
+_WEBSHOP_INLINE_PATCH_ACTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])apply_patch[ \t]*\r?\n"
+    r"(?P<patch>\*\*\* Begin Patch[\s\S]*?^\*\*\* End Patch[^\r\n]*)",
+    flags=re.MULTILINE,
+)
+_WEBSHOP_BARE_PATCH_INSTRUCTION_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_])`apply_patch`|"
+    r"(?<![A-Za-z0-9_`])apply_patch(?!`))\s+followed\s+(?:on\s+the\s+next\s+line\s+)?by",
+    flags=re.IGNORECASE,
+)
+_WEBSHOP_EMBEDDED_BROWSER_ACTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(search|click)\[", flags=re.IGNORECASE
+)
+_WEBSHOP_SESSION_TRACE_HEADER = "Current-session action trace:"
+_WEBSHOP_SESSION_TRACE_FOLLOWING_SECTION = "\n\nPersistent workspace tools:"
+_WEBSHOP_SESSION_TRACE_ENTRY_RE = re.compile(r"(?m)^- S(?P<index>\d+): ")
+_WEBSHOP_POLICY_TRACE_BOUNDED_MARKER = "- Policy-view trace bounded:"
+WEBSHOP_POLICY_SESSION_TRACE_MAX_CHARS = 12_288
+WEBSHOP_POLICY_SESSION_TRACE_ENTRY_MAX_CHARS = 4_096
+_WEBSHOP_RENDERED_STATE_HEADER_RE = re.compile(
+    r"(?m)^Task family: bundled_shopping\nProgress: \d+/6$"
+)
+_WEBSHOP_APPROVED_PRODUCT_CARDS_HEADER = "Customer-approved product cards:\n"
+_WEBSHOP_APPROVED_PRODUCT_TITLE_RE = re.compile(
+    r"(?m)^- Product: (?P<title>[^\r\n]+)$"
+)
+_WEBSHOP_PRODUCT_PAGE_TITLE_PREFIX = (
+    " [SEP] Back to Search [SEP] < Prev [SEP] "
+)
+_WEBSHOP_PRODUCT_PAGE_TITLE_SUFFIX = " [SEP] Price: "
+_WEBSHOP_LEGACY_WORKSPACE_CONTRACT = "\n".join(
+    (
+        "Persistent workspace tools:",
+        "The private workspace persists across shopping sessions in this episode.",
+        'Canonical shell form: bash {"command":"rg -n pattern ."}',
+        "The literal bash prefix and one separating space are required; a bare JSON object, markdown code fence, or explanation is invalid.",
+        "bash runs in a networkless, resource-bounded workspace sandbox.",
+        "The tool has zero task reward. Paths are workspace-relative.",
+    )
+)
+_WEBSHOP_QWEN_WORKSPACE_CONTRACT = "\n".join(
+    (
+        "Persistent workspace tools:",
+        "The private workspace persists across shopping sessions in this episode.",
+        "Use only the complete Qwen XML bash function-call form defined in the system message; endpoint-internal bare action syntax is not a policy response.",
+        "bash runs in a networkless, resource-bounded workspace sandbox.",
+        "The tool has zero task reward. Paths are workspace-relative.",
+    )
+)
+
+
+_WEBSHOP_LEGACY_WORKSPACE_CONTRACT_RE = re.compile(
+    r"(?m)^Persistent workspace tools:(?:\n(?!Result: )[^\n]+)*"
+)
+
+
+def _replace_webshop_legacy_contract(match):
+    section = match.group(0)
+    if "bash" not in section:
+        return section
+    return _WEBSHOP_QWEN_WORKSPACE_CONTRACT
+
+
+def _drop_webshop_contract_if_server_boilerplate(match):
+
+
+    section = match.group(0)
+    if "bash" not in section:
+        return section
+    return ""
+
+
+_WEBSHOP_ROUNDS_FOOTER_RE = re.compile(
+    r"\n+\[(?:Shop policy rounds used: \d+\.|"
+    r"Shop round budget: round \d+ of \d+; \d+ rounds remain\.|"
+    r"Webshop FINAL TURN: [^\]]*)\]$"
+)
+
+
+_WEBSHOP_FINAL_TURN_NOTICE = (
+    "[Webshop "
+    "FINAL TURN: your next response is the last action of this episode; "
+    "there is no next turn. Items not bought in this response earn no "
+    "reward. If the current page is the approved listing for a required "
+    "item, complete that purchase right now. If it is not, nothing in "
+    "this response can earn reward, so do not call bash and do not begin "
+    "new navigation. Take the action the current page itself instructs, "
+    "such as Back to Search, and let the episode end.]"
+)
+
+
+def _strip_webshop_rounds_footer(messages):
+
+    if not messages:
+        return messages
+    last = messages[-1]
+    if not isinstance(last, Mapping) or last.get("role") != "user":
+        return messages
+    content = last.get("content")
+    if not isinstance(content, str):
+        return messages
+    stripped = _WEBSHOP_ROUNDS_FOOTER_RE.sub("", content)
+    if stripped == content:
+        return list(messages)
+    replacement = dict(last)
+    replacement["content"] = stripped
+    return [*messages[:-1], replacement]
+
+
+def _dedupe_webshop_workspace_contract(
+    framing_content: str, observation: str
+) -> str:
+
+
+    if "Persistent workspace tools:" not in framing_content:
+        return observation
+    return _WEBSHOP_LEGACY_WORKSPACE_CONTRACT_RE.sub(
+        _drop_webshop_contract_if_server_boilerplate, observation
+    )
+
+
+def _webshop_authoritative_rendered_state(
+    observation: str,
+    session_trace: Sequence[str] | None,
+) -> str:
+
+
+    trace_span = _webshop_session_trace_span(
+        observation,
+        session_trace=session_trace,
+    )
+    if trace_span is not None:
+        state_and_prefix = observation[: trace_span[0]]
+    else:
+        trace_start = observation.find(_WEBSHOP_SESSION_TRACE_HEADER)
+        state_and_prefix = (
+            observation[:trace_start] if trace_start >= 0 else observation
+        )
+    headers = list(_WEBSHOP_RENDERED_STATE_HEADER_RE.finditer(state_and_prefix))
+    if headers:
+        return state_and_prefix[headers[-1].start() :]
+    return state_and_prefix
+
+
+def _webshop_attested_product_title_match(
+    observation: str,
+    session_trace: Sequence[str] | None,
+) -> bool | None:
+
+
+    if session_trace is None or isinstance(session_trace, (str, bytes)):
+        return None
+    current_page = _webshop_authoritative_rendered_state(
+        observation,
+        session_trace,
+    )
+    selected_title = None
+    for entry in reversed(session_trace):
+        action_line, separator, _result = str(entry).partition("\nResult:")
+        if not separator or not action_line.startswith("Action: "):
+            continue
+        parsed = _parse_native_bracket_action(action_line.removeprefix("Action: "))
+        if parsed is not None and parsed[0] == "search":
+            selected_title = parsed[1]
+            break
+    if selected_title is None:
+        return None
+
+    marker_index = current_page.rfind(_WEBSHOP_PRODUCT_PAGE_TITLE_PREFIX)
+    if marker_index < 0:
+        return None
+    cards_start = current_page.rfind(
+        _WEBSHOP_APPROVED_PRODUCT_CARDS_HEADER,
+        0,
+        marker_index,
+    )
+    if cards_start < 0:
+        return None
+    approved_titles = {
+        match.group("title").strip()
+        for match in _WEBSHOP_APPROVED_PRODUCT_TITLE_RE.finditer(
+            current_page[cards_start:marker_index]
+        )
+        if match.group("title").strip()
+    }
+    if selected_title not in approved_titles:
+        return None
+    page_body_start = marker_index + len(_WEBSHOP_PRODUCT_PAGE_TITLE_PREFIX)
+    title_end = current_page.find(_WEBSHOP_PRODUCT_PAGE_TITLE_SUFFIX, page_body_start)
+    if title_end < 0:
+        return None
+
+
+    title_separator = current_page.rfind(" [SEP] ", page_body_start, title_end)
+    title_start = (
+        title_separator + len(" [SEP] ")
+        if title_separator >= page_body_start
+        else page_body_start
+    )
+    current_title = current_page[title_start:title_end].strip()
+    if not current_title:
+        return None
+    return current_title == selected_title
+
+
+def _webshop_current_step_guidance(
+    observation: str,
+    *,
+    session_index: int | None = None,
+    product_note_written: bool | None = None,
+    session_trace: Sequence[str] | None = None,
+) -> str | None:
+
+
+    rendered_state = _webshop_authoritative_rendered_state(
+        observation,
+        session_trace,
+    )
+    legacy_matches = list(
+        _WEBSHOP_LEGACY_AVAILABLE_ACTIONS_RE.finditer(rendered_state)
+    )
+    qwen_matches = list(
+        _WEBSHOP_QWEN_AVAILABLE_FUNCTIONS_RE.finditer(rendered_state)
+    )
+    legacy_match = legacy_matches[-1] if legacy_matches else None
+    qwen_match = qwen_matches[-1] if qwen_matches else None
+    matches = [match for match in (legacy_match, qwen_match) if match is not None]
+    if not matches:
+        return None
+    match = max(matches, key=lambda item: item.start())
+    block = match.group("actions")
+    if match.re is _WEBSHOP_LEGACY_AVAILABLE_ACTIONS_RE:
+        actions: list[tuple[str, str]] = []
+        for raw_line in block.splitlines():
+            action = raw_line.removeprefix("- ")
+            name, _, argument = action.partition("[")
+            argument = argument[:-1] if argument.endswith("]") else argument
+            actions.append((name, argument))
+        has_search = any(name == "search" for name, _ in actions)
+        click_items = [argument for name, argument in actions if name == "click"]
+    else:
+        has_search = "- `search` function;" in block
+        click_items = []
+        for raw_line in block.splitlines():
+            prefix = "- `click` function; available `item` value: "
+            if not raw_line.startswith(prefix):
+                continue
+            try:
+                item = json.loads(raw_line.removeprefix(prefix))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, str):
+                click_items.append(item)
+    if has_search:
+        if session_index is not None and session_index > 0:
+
+
+            return (
+                "Current-step browser state: the current session is on "
+                "the Search page. Follow the task statement's current "
+                "first-action instruction for this session."
+            )
+        return (
+            "Current-step browser state: the current session is on the Search page. "
+            "Use `search` exactly once with the approved product's complete title."
+        )
+    if not click_items:
+        return None
+    if any(item.casefold() == "buy now" for item in click_items):
+        has_back_to_search = any(
+            item.casefold() == "back to search" for item in click_items
+        )
+        mismatch_recovery = (
+            "call `click` with `Back to Search`"
+            if has_back_to_search
+            else "use an available browser navigation item to return to the search results"
+        )
+        title_match = _webshop_attested_product_title_match(
+            observation, session_trace
+        )
+        if title_match is False:
+            required_navigation = (
+                "The next function must be `click` with `Back to Search`"
+                if has_back_to_search
+                else "The next action must return to the search results"
+            )
+            return (
+                "Current-step browser state: Wrapper-attested title mismatch; the "
+                "current product page is not the selected approved listing. "
+                f"{required_navigation}; do not call "
+                "`bash` or `Buy Now`."
+            )
+        identity_check = (
+            "Current-step browser state: Wrapper-attested exact title match; the "
+            "current product page is the selected approved listing. "
+            if title_match is True
+            else (
+                "Current-step browser state: a product page with `Buy Now` is open, "
+                "but the wrapper could not attest the selected title. Compare the "
+                "page's complete visible title with the selected approved card. "
+            )
+        )
+        if isinstance(session_index, int) and session_index >= 5:
+            if title_match is True:
+                return identity_check + (
+                    "The next function must be `click` with `Buy Now`. This is the "
+                    "final session, so no new note is required; do not inspect the "
+                    "workspace."
+                )
+            return identity_check + (
+                f"If the titles do not exactly match, {mismatch_recovery}; do not "
+                "buy. Only if they exactly match, call `click` with `Buy Now` now. "
+                "This is the final session, so no new note is required; do not "
+                "inspect the workspace."
+            )
+        if product_note_written is True:
+            if title_match is True:
+                return identity_check + (
+                    "The required one-time note write for this session has succeeded. "
+                    "The next function must be `click` with `Buy Now`; do not "
+                    "search, inspect, or rewrite the workspace first."
+                )
+            return identity_check + (
+                "The required one-time note write for this session has succeeded. "
+                f"If the titles do not exactly match, {mismatch_recovery}; do "
+                "not buy or rewrite the successful note. Only if they "
+                "exactly match, call `click` with `Buy Now` now; do not search, "
+                "inspect, or rewrite the workspace first."
+            )
+        if product_note_written is False:
+            if title_match is True:
+                return identity_check + (
+                    "The required one-time note write has not yet succeeded in this "
+                    "session. The next function must be `bash` writing the "
+                    "card's exact `Confirmed <field>: <value>` line to one new note "
+                    "path with a quoted heredoc; "
+                    "do not call any other function first."
+                )
+            return identity_check + (
+                "The required one-time note write has not yet succeeded in this "
+                "session. If the titles do not exactly match, "
+                f"{mismatch_recovery}; do not write a note or buy. Only if they "
+                "exactly match, call `bash` now with one quoted heredoc that "
+                "writes the card's exact `Confirmed <field>: <value>` line to one "
+                "new note path; do not search first."
+            )
+        return None
+    return (
+        "Current-step browser state: a search-result page is already open, so the "
+        "session-start search is complete and must not be repeated. Call `click` "
+        "with the displayed ASIN whose complete title matches the approved card."
+    )
+
+
+def _render_webshop_available_functions(match: re.Match[str]) -> str:
+    rendered = ["Native WebShop functions currently available through Qwen XML:"]
+    for raw_line in match.group("actions").splitlines():
+        action = raw_line.removeprefix("- ")
+        name, _, argument = action.partition("[")
+        argument = argument[:-1] if argument.endswith("]") else argument
+        parameter = "keywords" if name == "search" else "item"
+        if name == "search" and argument == "keywords":
+            rendered.append(
+                "- `search` function; required `keywords` parameter: one non-empty string"
+            )
+        else:
+            rendered.append(
+                f"- `{name}` function; available `{parameter}` value: "
+                f"{json.dumps(argument, ensure_ascii=False)}"
+            )
+    return "\n".join(rendered) + "\n"
+
+
+def _replace_embedded_webshop_browser_actions(text: str) -> str:
+
+
+    output: list[str] = []
+    cursor = 0
+    while True:
+        match = _WEBSHOP_EMBEDDED_BROWSER_ACTION_RE.search(text, cursor)
+        if match is None:
+            output.append(text[cursor:])
+            return "".join(output)
+        argument_start = match.end()
+        depth = 1
+        end = argument_start
+        while end < len(text) and depth:
+            if text[end] == "[":
+                depth += 1
+            elif text[end] == "]":
+                depth -= 1
+            end += 1
+        if depth:
+
+
+            output.append(text[cursor : match.start()])
+            output.append(f"the textual `{match.group(1).lower()}` function record beginning ")
+            cursor = argument_start
+            continue
+        name = match.group(1).lower()
+        parameter = "keywords" if name == "search" else "item"
+        argument = text[argument_start : end - 1]
+        output.append(text[cursor : match.start()])
+        output.append(describe_inert_qwen_function_record(name, {parameter: argument}))
+        cursor = end
+
+
+def _replace_embedded_webshop_shell_actions(text: str) -> str:
+
+
+    output: list[str] = []
+    cursor = 0
+    decoder = json.JSONDecoder()
+    while True:
+        match = _WEBSHOP_INLINE_SHELL_ACTION_RE.search(text, cursor)
+        if match is None:
+            output.append(text[cursor:])
+            return "".join(output)
+        object_start = match.end()
+        try:
+            arguments, length = decoder.raw_decode(text[object_start:])
+        except json.JSONDecodeError:
+
+
+            output.append(text[cursor:object_start])
+            cursor = object_start
+            continue
+        if not isinstance(arguments, dict) or "command" not in arguments:
+            output.append(text[cursor : match.start()])
+            output.append(
+                describe_inert_qwen_function_record(
+                    "bash", {"record": arguments}
+                )
+            )
+            cursor = object_start + length
+            continue
+        output.append(text[cursor : match.start()])
+        output.append(describe_inert_qwen_function_record("bash", arguments))
+        cursor = object_start + length
+
+
+def _replace_embedded_webshop_ask_actions(text: str) -> str:
+
+
+    output: list[str] = []
+    cursor = 0
+    decoder = json.JSONDecoder()
+    while True:
+        match = _WEBSHOP_INLINE_ASK_ACTION_RE.search(text, cursor)
+        if match is None:
+            output.append(text[cursor:])
+            return "".join(output)
+        object_start = match.end()
+        try:
+            arguments, length = decoder.raw_decode(text[object_start:])
+        except json.JSONDecodeError:
+            output.append(text[cursor:object_start])
+            cursor = object_start
+            continue
+        if not isinstance(arguments, dict) or "field" not in arguments:
+            output.append(text[cursor : match.start()])
+            output.append(
+                describe_inert_qwen_function_record("ask", {"record": arguments})
+            )
+            cursor = object_start + length
+            continue
+        output.append(text[cursor : match.start()])
+        output.append(describe_inert_qwen_function_record("ask", arguments))
+        cursor = object_start + length
+
+
+def _replace_embedded_webshop_patch_actions(text: str) -> str:
+
+
+    return _WEBSHOP_INLINE_PATCH_ACTION_RE.sub(
+        lambda match: describe_inert_qwen_function_record(
+            "apply_patch", {"patch": match.group("patch")}
+        ),
+        text,
+    )
+
+
+def _render_webshop_session_trace(trace: Sequence[str]) -> str:
+    lines = [_WEBSHOP_SESSION_TRACE_HEADER]
+    lines.extend(f"- S{index}: {item}" for index, item in enumerate(trace))
+    if not trace:
+        lines.append("<empty>")
+    return "\n".join(lines)
+
+
+def _webshop_session_trace_span(
+    text: str,
+    *,
+    session_trace: Sequence[str] | None = None,
+) -> tuple[int, int] | None:
+
+
+    if session_trace is not None and not isinstance(session_trace, (str, bytes)):
+        expected = _render_webshop_session_trace([str(item) for item in session_trace])
+        needle = expected + _WEBSHOP_SESSION_TRACE_FOLLOWING_SECTION
+        start = text.rfind(needle)
+        if start >= 0:
+            return start, start + len(expected)
+
+    start = text.find(_WEBSHOP_SESSION_TRACE_HEADER)
+    if start < 0:
+        return None
+    end = text.find(
+        _WEBSHOP_SESSION_TRACE_FOLLOWING_SECTION,
+        start + len(_WEBSHOP_SESSION_TRACE_HEADER),
+    )
+    if end < 0:
+        return None
+    return start, end
+
+
+def _truncate_webshop_trace_entry(entry: str, max_chars: int) -> tuple[str, bool]:
+    if len(entry) <= max_chars:
+        return entry, False
+    digest = hashlib.sha256(entry.encode("utf-8")).hexdigest()
+    marker = (
+        "\n<entry content omitted from policy view; "
+        f"entry_sha256={digest}>\n"
+    )
+    remaining = max_chars - len(marker)
+    if remaining <= 0:
+        return marker[:max_chars], True
+    head_chars = (remaining * 2) // 3
+    tail_chars = remaining - head_chars
+    tail = entry[-tail_chars:] if tail_chars else ""
+    return entry[:head_chars] + marker + tail, True
+
+
+def _bound_webshop_policy_session_trace(
+    observation: str,
+    *,
+    audit_trace_section: str | None = None,
+) -> str:
+
+
+    span = _webshop_session_trace_span(observation)
+    if span is None:
+        return observation
+    start, end = span
+    section = observation[start:end]
+    if len(section) <= WEBSHOP_POLICY_SESSION_TRACE_MAX_CHARS:
+        return observation
+
+    matches = list(_WEBSHOP_SESSION_TRACE_ENTRY_RE.finditer(section))
+    indices = [int(match.group("index")) for match in matches]
+    if not matches or indices != list(range(len(matches))):
+
+
+        digest_source = audit_trace_section or section
+        digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+        marker = (
+            f"{_WEBSHOP_POLICY_TRACE_BOUNDED_MARKER} entry_boundaries=unknown; "
+            f"full_trace_sha256={digest}; full trace remains in the environment audit."
+        )
+        available = (
+            WEBSHOP_POLICY_SESSION_TRACE_MAX_CHARS
+            - len(_WEBSHOP_SESSION_TRACE_HEADER)
+            - len(marker)
+            - 2
+        )
+        body = section[len(_WEBSHOP_SESSION_TRACE_HEADER) :].lstrip("\n")
+        head_chars = max(0, available // 3)
+        tail_chars = max(0, available - head_chars)
+        tail = body[-tail_chars:] if tail_chars else ""
+        bounded = "\n".join(
+            (
+                _WEBSHOP_SESSION_TRACE_HEADER,
+                marker,
+                body[:head_chars] + tail,
+            )
+        )
+        return observation[:start] + bounded + observation[end:]
+
+    entries = [
+        section[match.start() : matches[index + 1].start()].rstrip("\n")
+        if index + 1 < len(matches)
+        else section[match.start() :].rstrip("\n")
+        for index, match in enumerate(matches)
+    ]
+    projected = [
+        _truncate_webshop_trace_entry(
+            entry, WEBSHOP_POLICY_SESSION_TRACE_ENTRY_MAX_CHARS
+        )
+        for entry in entries
+    ]
+    digest_source = audit_trace_section or section
+    digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    selected: list[tuple[str, bool]] = []
+    for candidate in reversed(projected):
+        proposed = [candidate, *selected]
+        omitted = len(entries) - len(proposed)
+        truncated_retained = sum(was_truncated for _, was_truncated in proposed)
+        marker = (
+            f"{_WEBSHOP_POLICY_TRACE_BOUNDED_MARKER} "
+            f"retained_latest={len(proposed)}/{len(entries)}; "
+            f"earlier_omitted={omitted}; "
+            f"truncated_retained={truncated_retained}; "
+            f"full_trace_sha256={digest}; "
+            "full trace remains in the environment audit."
+        )
+        bounded = "\n".join(
+            (
+                _WEBSHOP_SESSION_TRACE_HEADER,
+                marker,
+                *(entry for entry, _ in proposed),
+            )
+        )
+        if len(bounded) > WEBSHOP_POLICY_SESSION_TRACE_MAX_CHARS:
+            break
+        selected = proposed
+
+    if not selected:
+        raise RuntimeError("WebShop policy trace budget cannot retain its latest entry")
+    omitted = len(entries) - len(selected)
+    truncated_retained = sum(was_truncated for _, was_truncated in selected)
+    marker = (
+        f"{_WEBSHOP_POLICY_TRACE_BOUNDED_MARKER} "
+        f"retained_latest={len(selected)}/{len(entries)}; "
+        f"earlier_omitted={omitted}; "
+        f"truncated_retained={truncated_retained}; "
+        f"full_trace_sha256={digest}; "
+        "full trace remains in the environment audit."
+    )
+    bounded = "\n".join(
+        (
+            _WEBSHOP_SESSION_TRACE_HEADER,
+            marker,
+            *(entry for entry, _ in selected),
+        )
+    )
+    if len(bounded) > WEBSHOP_POLICY_SESSION_TRACE_MAX_CHARS:
+        raise RuntimeError("WebShop policy trace exceeded its bounded envelope")
+    return observation[:start] + bounded + observation[end:]
+
+
+def normalize_filesystem_webshop_policy_observation(
+    observation: str,
+    *,
+    session_index: int | None = None,
+    product_note_written: bool | None = None,
+    session_trace: Sequence[str] | None = None,
+) -> str:
+
+
+    if not isinstance(observation, str):
+        raise TypeError("WebShop policy observation must be text")
+    current_step_guidance = _webshop_current_step_guidance(
+        observation,
+        session_index=session_index,
+        product_note_written=product_note_written,
+        session_trace=session_trace,
+    )
+    raw_trace_span = _webshop_session_trace_span(
+        observation,
+        session_trace=session_trace,
+    )
+    raw_trace_section = (
+        observation[raw_trace_span[0] : raw_trace_span[1]]
+        if raw_trace_span is not None
+        else None
+    )
+
+
+    visible = _replace_embedded_webshop_patch_actions(observation)
+    visible = _WEBSHOP_LEGACY_AVAILABLE_ACTIONS_RE.sub(
+        _render_webshop_available_functions, visible
+    )
+    visible = _WEBSHOP_LEGACY_WORKSPACE_CONTRACT_RE.sub(
+        _replace_webshop_legacy_contract, visible
+    )
+
+
+    visible = _replace_embedded_webshop_shell_actions(visible)
+    visible = _replace_embedded_webshop_ask_actions(visible)
+    visible = _WEBSHOP_LEGACY_INVALID_ACTION_RE.sub(
+        lambda match: match.group("prefix") + _WEBSHOP_QWEN_INVALID_ACTION,
+        visible,
+    )
+    visible = _replace_embedded_webshop_browser_actions(visible)
+    visible = _WEBSHOP_BARE_PATCH_INSTRUCTION_RE.sub(
+        "the complete Qwen XML bash function call uses", visible
+    )
+
+
+    visible = _WEBSHOP_INLINE_SHELL_ACTION_RE.sub(
+        "the textual `bash` record beginning ", visible
+    )
+    visible = _WEBSHOP_INLINE_ASK_ACTION_RE.sub(
+        "the textual `ask` function record beginning ", visible
+    )
+    visible = _bound_webshop_policy_session_trace(
+        visible,
+        audit_trace_section=raw_trace_section,
+    )
+    if current_step_guidance is not None and current_step_guidance not in visible:
+        visible = visible.rstrip() + "\n\n" + current_step_guidance
+    return visible
+
+
+def _optional_transition_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("transition counters must not be boolean")
+    return int(value)
+
+
+def _copy_policy_messages(
+    messages: Sequence[Mapping[str, str]],
+) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise TypeError(f"policy message {index} must be a mapping")
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"system", "user", "assistant", "tool"}:
+            raise ValueError(f"policy message {index} has invalid role: {role!r}")
+        if not isinstance(content, str):
+            raise TypeError(f"policy message {index} content must be text")
+        normalized_message = {"role": role, "content": content}
+        if role == "tool":
+            name = message.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"policy tool message {index} must carry a nonempty name"
+                )
+            normalized_message["name"] = name
+        normalized.append(normalized_message)
+    if not normalized:
+        raise ValueError("policy context must not be empty")
+    return normalized
+
+
+def _reported_webshop_session(info: Mapping[str, Any], fallback: int) -> int:
+    value = info.get("current_subtask_index")
+    if value is None:
+        return fallback
+    if isinstance(value, bool):
+        raise ValueError("current_subtask_index must not be boolean")
+    result = int(value)
+    if result < 0:
+        raise ValueError("current_subtask_index must be non-negative")
+    return result
+
+
+def _validate_webshop_session_advance(
+    info: Mapping[str, Any],
+    *,
+    before: int,
+    after: int,
+    done: bool,
+) -> bool:
+    if after not in {before, before + 1}:
+        raise RuntimeError(
+            "WebShop session index must stay fixed or advance by exactly one"
+        )
+    tool_ops = info.get("tool_ops", ())
+    if not isinstance(tool_ops, Sequence) or isinstance(tool_ops, (str, bytes)):
+        raise RuntimeError("WebShop transition evidence must contain a tool_ops list")
+    advances = [
+        item
+        for item in tool_ops
+        if isinstance(item, Mapping) and item.get("session_advanced") is True
+    ]
+    advanced = after == before + 1
+    if advanced:
+        if len(advances) != 1:
+            raise RuntimeError(
+                "WebShop session advance requires exactly one authoritative BUY record"
+            )
+        buy = advances[0]
+        if (
+            str(buy.get("op", "")).upper() != "BUY"
+            or buy.get("committed") is not True
+            or buy.get("purchase_correct") is not True
+        ):
+            raise RuntimeError("WebShop session advance has invalid BUY evidence")
+        if not done and info.get("session_trace") != []:
+            raise RuntimeError(
+                "WebShop session advance must clear the native session trace"
+            )
+    elif advances:
+        raise RuntimeError(
+            "WebShop tool evidence claims a session advance without an index change"
+        )
+    return advanced
+
+
+FORMAL_SCHEMA_V3 = "agentmemory_formal_step_v3"
+WEBSHOP_V2_SURFACE = "memoryarena_webshop_native_v1"
+PROCEDURAL_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_procedural_natural_chain_train_v1"
+)
+PROCEDURAL_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+)
+LATENT_PREFERENCE_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_latent_preference_train_v1"
+)
+LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_latent_preference_filesystem_v2"
+)
+RECENCY_OVERRIDE_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_recency_override_train_v1"
+)
+RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_recency_override_filesystem_v2"
+)
+DISTRACTOR_ROBUSTNESS_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_distractor_robustness_top1_train_v1"
+)
+DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_distractor_robustness_filesystem_v2"
+)
+COMPOSITIONAL_RECALL_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_compositional_recall_top1_train_v1"
+)
+COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_compositional_recall_filesystem_v2"
+)
+INTENT_CLARIFICATION_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_intent_clarification_train_v1"
+)
+INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_intent_clarification_filesystem_v2"
+)
+SELECTIVE_MEMORY_USE_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_selective_memory_use_top1_train_v1"
+)
+SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_selective_memory_use_filesystem_v2"
+)
+NEGATIVE_CONSTRAINT_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_negative_constraint_top1_train_v1"
+)
+NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_SURFACE = (
+    "agentmemory_webshop_negative_constraint_filesystem_v2"
+)
+PREFERENCE_WEBSHOP_SURFACES = frozenset(
+    {
+        LATENT_PREFERENCE_WEBSHOP_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_SURFACE,
+        RECENCY_OVERRIDE_WEBSHOP_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+LATENT_PREFERENCE_WEBSHOP_SURFACES = frozenset(
+    {
+        LATENT_PREFERENCE_WEBSHOP_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+INTENT_CLARIFICATION_WEBSHOP_SURFACES = frozenset(
+    {
+        INTENT_CLARIFICATION_WEBSHOP_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+SELECTIVE_MEMORY_USE_WEBSHOP_SURFACES = frozenset(
+    {
+        SELECTIVE_MEMORY_USE_WEBSHOP_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+RECENCY_OVERRIDE_WEBSHOP_SURFACES = frozenset(
+    {
+        RECENCY_OVERRIDE_WEBSHOP_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+FILESYSTEM_WEBSHOP_SURFACES = frozenset(
+    {
+        PROCEDURAL_FILESYSTEM_WEBSHOP_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE,
+        DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_SURFACE,
+        COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_SURFACE,
+        NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+DISTRACTOR_ROBUSTNESS_WEBSHOP_SURFACES = frozenset(
+    {
+        DISTRACTOR_ROBUSTNESS_WEBSHOP_SURFACE,
+        DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+COMPOSITIONAL_RECALL_WEBSHOP_SURFACES = frozenset(
+    {
+        COMPOSITIONAL_RECALL_WEBSHOP_SURFACE,
+        COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+NEGATIVE_CONSTRAINT_WEBSHOP_SURFACES = frozenset(
+    {
+        NEGATIVE_CONSTRAINT_WEBSHOP_SURFACE,
+        NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_SURFACE,
+    }
+)
+QUERY_TOP1_WEBSHOP_SURFACES = frozenset(
+    {
+        DISTRACTOR_ROBUSTNESS_WEBSHOP_SURFACE,
+        COMPOSITIONAL_RECALL_WEBSHOP_SURFACE,
+        INTENT_CLARIFICATION_WEBSHOP_SURFACE,
+        SELECTIVE_MEMORY_USE_WEBSHOP_SURFACE,
+        NEGATIVE_CONSTRAINT_WEBSHOP_SURFACE,
+    }
+)
+LATENT_PREFERENCE_SOP_WEBSHOP_SURFACES = frozenset(
+    {
+        LATENT_PREFERENCE_WEBSHOP_SURFACE,
+        RECENCY_OVERRIDE_WEBSHOP_SURFACE,
+        DISTRACTOR_ROBUSTNESS_WEBSHOP_SURFACE,
+        COMPOSITIONAL_RECALL_WEBSHOP_SURFACE,
+        INTENT_CLARIFICATION_WEBSHOP_SURFACE,
+        NEGATIVE_CONSTRAINT_WEBSHOP_SURFACE,
+    }
+)
+PROGRAMMATIC_WEBSHOP_SURFACES = frozenset(
+    {
+        PROCEDURAL_WEBSHOP_SURFACE,
+        *FILESYSTEM_WEBSHOP_SURFACES,
+        SELECTIVE_MEMORY_USE_WEBSHOP_SURFACE,
+        *LATENT_PREFERENCE_SOP_WEBSHOP_SURFACES,
+    }
+)
+LATENT_PREFERENCE_PROMPT_MODE = "latent_preference_sop"
+SELECTIVE_MEMORY_PROMPT_MODE = "selective_memory_sop"
+NATURAL_FILESYSTEM_PROMPT_MODE = "natural_filesystem"
+FILESYSTEM_SURFACE_CONTRACTS = {
+    PROCEDURAL_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_natural_chain_provider_v4",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "boundary_session_index": 1,
+        "prompt_family": "natural_attribute_chain_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_latent_preference_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "boundary_session_index": 1,
+        "prompt_family": "latent_preference_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_recency_override_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "boundary_session_index": 3,
+        "prompt_family": "recency_override_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_distractor_robustness_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_distractor_condition_within_orbit_v1",
+        "boundary_session_index": 1,
+        "prompt_family": "distractor_robustness_filesystem_v2",
+        "source_state": "policy_authored_current_record_plus_branch_distractors",
+        "seed_contract": "branch_conditioned_ordinary_profile_files_v1",
+        "evaluation_contract": "paired_distractor_robustness_v1",
+    },
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_compositional_recall_provider_v1",
+        "tasks_per_orbit": 4,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "boundary_session_index": 2,
+        "prompt_family": "compositional_recall_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_intent_clarification_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "boundary_session_index": 1,
+        "prompt_family": "intent_clarification_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_selective_memory_use_provider_v1",
+        "tasks_per_orbit": 4,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_preference_coordinate_within_factorial_v1",
+        "boundary_session_index": 1,
+        "prompt_family": "selective_memory_use_filesystem_v2",
+        "source_state": "harness_seeded_branch_profile_with_optional_policy_edits",
+        "seed_contract": "branch_conditioned_initial_profile_files_v1",
+        "evaluation_contract": (
+            "selective_required_separation_not_required_invariance_v1"
+        ),
+    },
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_SURFACE: {
+        "provider_schema": "agentmemory_verified_negative_constraint_provider_v1",
+        "tasks_per_orbit": 3,
+        "candidate_count_per_phase": 3,
+        "source_pairing": "cyclic_next_within_orbit_v1",
+        "boundary_session_index": 1,
+        "prompt_family": "negative_constraint_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+}
+FILESYSTEM_WORKSPACE_LIMIT_FIELDS = frozenset(
+    {
+        "max_path_chars",
+        "max_files",
+        "max_directories",
+        "max_file_bytes",
+        "max_total_bytes",
+        "max_command_chars",
+        "max_patch_bytes",
+        "default_timeout_ms",
+        "max_timeout_ms",
+        "cpu_seconds",
+        "address_space_bytes",
+        "max_processes",
+        "max_open_files",
+        "stdout_bytes",
+        "stderr_bytes",
+        "tmp_bytes",
+        "tmp_inodes",
+    }
+)
+FILESYSTEM_SANDBOX_FIELDS = {
+    "contract": "linux_namespace_chroot_tmpfs_v1",
+    "formal_eligible": True,
+    "network": "new_namespace_no_routes",
+    "rootfs": "minimal_read_only_system_roots",
+    "workspace_mount": "bounded_tmpfs_copy_in_copy_out",
+    "shell": "bash_no_profile_no_rc",
+    "ripgrep_path": "/tools/rg",
+    "ripgrep_revalidation": "stat_fingerprint_before_each_command",
+    "model_identity": "exclusive_leased_high_uid_per_command",
+    "rlimit_nproc_scope": "host_uid_lease_per_concurrent_command",
+    "uid_lease_slots": 4096,
+    "no_new_privileges": True,
+    "capability_bounding_set": "empty",
+    "process_namespace": True,
+    "mount_namespace": True,
+    "ipc_namespace": True,
+    "uts_namespace": True,
+}
+FILESYSTEM_SANDBOX_BOOLEAN_FIELDS = frozenset(
+    {
+        "formal_eligible",
+        "no_new_privileges",
+        "process_namespace",
+        "mount_namespace",
+        "ipc_namespace",
+        "uts_namespace",
+    }
+)
+FILESYSTEM_SANDBOX_RESOURCE_FIELDS = frozenset(
+    {
+        "workspace_bytes",
+        "workspace_inodes",
+        "max_files",
+        "max_directories",
+        "max_file_bytes",
+        "max_path_chars",
+        "default_timeout_ms",
+        "max_timeout_ms",
+        "cpu_seconds",
+        "address_space_bytes",
+        "max_processes",
+        "max_open_files",
+        "stdout_bytes",
+        "stderr_bytes",
+        "tmp_bytes",
+        "tmp_inodes",
+    }
+)
+FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS = frozenset(
+    FILESYSTEM_SANDBOX_RESOURCE_FIELDS - {"workspace_bytes", "workspace_inodes"}
+)
+FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS = frozenset(
+    {"device", "inode", "mode", "size", "mtime_ns", "ctime_ns"}
+)
+MEMORY_PROMPT_MODES = (
+    "legacy",
+    "neutral",
+    "neutral_horizon",
+    "neutral_horizon_responsibility",
+    LATENT_PREFERENCE_PROMPT_MODE,
+    SELECTIVE_MEMORY_PROMPT_MODE,
+    NATURAL_FILESYSTEM_PROMPT_MODE,
+)
+NEUTRAL_HORIZON_CONTEXT = (
+    "This episode has six sequential shopping sessions. Later-session compatibility "
+    "constraints may refer to products purchased in earlier sessions."
+)
+CROSS_SESSION_MEMORY_RESPONSIBILITY = (
+    "Across shopping sessions, you are responsible for preserving and accessing any "
+    "facts needed for later decisions."
+)
+LATENT_PREFERENCE_SOP = (
+    "Each early evidence session may show which approved listing a customer "
+    "confirmed. Treat each confirmed choice as preference evidence. Preserve the "
+    "confirmed listing and its visible distinguishing attributes. After a confirmed "
+    "choice is visible, use ADD before click[Buy Now] to store that evidence or "
+    "create a customer-profile memory containing the customer, preference axis, and "
+    "inferred value. When a customer-profile memory already exists, first retrieve "
+    "its exact memory_id and use UPDATE to incorporate additional evidence without "
+    "discarding prior support. Do not assume a fixed number of examples is always "
+    "sufficient; infer a preference only when the visible confirmed choices support "
+    "it. At the start of every later shopping session, use RETRIEVE to expose the "
+    "relevant confirmed-choice evidence or customer profile. In later application "
+    "sessions, apply the retrieved preference when choosing between approved "
+    "listings. The environment does not perform these memory actions for you, and it "
+    "does not reject an otherwise correct purchase when ADD was skipped."
+)
+SELECTIVE_MEMORY_SOP = (
+    "First decide whether the current request already states every attribute needed "
+    "to choose between its approved listings. When the current request is complete, "
+    "follow it directly: explicit current requirements override profile history, and "
+    "you should not ADD or RETRIEVE merely by habit. When the current request omits "
+    "the customer's profile preference, use RETRIEVE to expose the saved current "
+    "profile before choosing. Store new memory only when the episode provides new "
+    "information that a later session will actually need."
+)
+QUERY_TOP1_RETRIEVAL_CONTRACT = (
+    "On this surface, RETRIEVE requires exactly query:string and returns exactly "
+    "one highest-ranked matching memory. memory_id and top_k are forbidden."
+)
+INTENT_CLARIFICATION_CONTRACT = (
+    "In the first shopping session, the request is intentionally ambiguous. Use "
+    'ASK {"field":"..."} exactly once with the ambiguity-resolving field named '
+    "by the task. The environment returns a CLARIFY observation; store that "
+    "clarification before the first purchase and retrieve it in later sessions."
+)
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+_THINK_CLOSE_RE = re.compile(r"</think\s*>", flags=re.IGNORECASE)
+
+
+def build_v3_conversation_start(
+    metadata: Mapping[str, Any],
+) -> tuple[ConversationMessage, ConversationMessage]:
+    system_prompt = _required_metadata_text(metadata, "system_prompt")
+    return (
+        ConversationMessage({"from": "human", "loss": None, "value": system_prompt}),
+        ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+    )
+
+
+def _required_metadata_text(metadata: Mapping[str, Any], key: str) -> str:
+    value = metadata.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"AgentMemoryGym metadata requires non-empty {key}")
+    return value.strip()
+
+
+def _validate_v3_metadata(metadata: Mapping[str, Any]) -> None:
+    for key in (
+        "surface",
+        "domain_id",
+        "contract_id",
+        "contract_sha256",
+        "system_prompt_sha256",
+    ):
+        _required_metadata_text(metadata, key)
+    contract_sha256 = str(metadata["contract_sha256"])
+    if _SHA256_RE.fullmatch(contract_sha256) is None:
+        raise RuntimeError(
+            "AgentMemoryGym v3 metadata contract_sha256 must be lowercase SHA-256"
+        )
+    prompt_sha256 = str(metadata["system_prompt_sha256"])
+    if _SHA256_RE.fullmatch(prompt_sha256) is None:
+        raise RuntimeError(
+            "AgentMemoryGym v3 metadata system_prompt_sha256 must be lowercase SHA-256"
+        )
+    system_prompt = _required_metadata_text(metadata, "system_prompt")
+    observed_prompt_sha256 = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+    if observed_prompt_sha256 != prompt_sha256:
+        raise RuntimeError(
+            "AgentMemoryGym v3 metadata system_prompt_sha256 does not match system_prompt"
+        )
+    native_actions = metadata.get("native_action_descriptions")
+    if not isinstance(native_actions, list) or not native_actions or any(
+        not isinstance(item, str) or not item.strip() for item in native_actions
+    ):
+        raise RuntimeError(
+            "AgentMemoryGym v3 metadata requires native_action_descriptions"
+        )
+    if any(item.strip() not in system_prompt for item in native_actions):
+        raise RuntimeError(
+            "AgentMemoryGym v3 system_prompt must contain every native action form"
+        )
+    build_v3_conversation_start(metadata)
+
+
+def _validate_programmatic_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    provider_schema: str,
+    tasks_per_orbit: int = 2,
+    candidate_count_per_phase: int = 2,
+    seed_epoch_boundary_field: str = (
+        "counterfactual_pair_never_crosses_seed_epoch"
+    ),
+) -> Mapping[str, Any]:
+    if metadata.get("source") != "agentmemory_programmatic_generator":
+        raise RuntimeError("Procedural AgentMemoryGym source metadata is invalid")
+    if metadata.get("paper_eligible") is not False:
+        raise RuntimeError("Procedural AgentMemoryGym must not be paper-eligible")
+    provider = metadata.get("provider")
+    if not isinstance(provider, Mapping):
+        raise RuntimeError("Procedural AgentMemoryGym metadata requires provider")
+    if provider.get("schema") != provider_schema:
+        raise RuntimeError("Programmatic AgentMemoryGym provider schema is unsupported")
+    if provider.get("tasks_per_orbit") != tasks_per_orbit:
+        raise RuntimeError(
+            "Programmatic AgentMemoryGym tasks_per_orbit metadata is invalid"
+        )
+    if provider.get("candidate_count_per_phase") != candidate_count_per_phase:
+        raise RuntimeError(
+            "Procedural AgentMemoryGym candidate_count_per_phase metadata is invalid"
+        )
+    if provider.get("phase_count_per_task") != 6:
+        raise RuntimeError("Procedural AgentMemoryGym requires six phases per task")
+    if provider.get("human_review_required") is not False:
+        raise RuntimeError("Procedural AgentMemoryGym must not require human review")
+    if provider.get("llm_judge_required") is not False:
+        raise RuntimeError("Procedural AgentMemoryGym must not require an LLM judge")
+    if provider.get("task_prompt_product_identity") != "complete_native_title":
+        raise RuntimeError(
+            "Procedural AgentMemoryGym task prompt product identity is invalid"
+        )
+    if provider.get("target_asin_in_task_prompt") is not False:
+        raise RuntimeError(
+            "Procedural AgentMemoryGym task prompt must not reveal the target ASIN"
+        )
+    if provider.get("native_search_result_asin_handles_visible") is not True:
+        raise RuntimeError(
+            "Procedural AgentMemoryGym must preserve native search-result ASIN handles"
+        )
+    if provider.get("native_click_action_uses_asin_handle") is not True:
+        raise RuntimeError(
+            "Procedural AgentMemoryGym must preserve native click[ASIN] actions"
+        )
+    provider_mode = provider.get("provider_mode")
+    if provider_mode not in {"fixed_window", "reseeded_stream"}:
+        raise RuntimeError("Procedural AgentMemoryGym provider mode is unsupported")
+    task_count = metadata.get("task_count")
+    if (
+        isinstance(task_count, bool)
+        or not isinstance(task_count, int)
+        or task_count <= 0
+        or task_count % tasks_per_orbit
+        or provider.get("task_count") != task_count
+    ):
+        raise RuntimeError("Procedural AgentMemoryGym task_count metadata is invalid")
+    if metadata.get("provider_mode") != provider_mode:
+        raise RuntimeError("Procedural AgentMemoryGym provider mode metadata disagrees")
+    accepted_index_domain = provider.get("accepted_index_domain")
+    if metadata.get("accepted_index_domain") != accepted_index_domain:
+        raise RuntimeError(
+            "Procedural AgentMemoryGym accepted index domain metadata disagrees"
+        )
+    semantic_period_orbits = provider.get("semantic_period_orbits")
+    semantic_period_tasks = provider.get("semantic_period_tasks")
+    if (
+        isinstance(semantic_period_orbits, bool)
+        or not isinstance(semantic_period_orbits, int)
+        or semantic_period_orbits <= 0
+        or isinstance(semantic_period_tasks, bool)
+        or not isinstance(semantic_period_tasks, int)
+        or semantic_period_tasks != semantic_period_orbits * tasks_per_orbit
+    ):
+        raise RuntimeError(
+            "Procedural AgentMemoryGym semantic period metadata is invalid"
+        )
+    stream = provider.get("reseeded_stream")
+    if provider_mode == "reseeded_stream":
+        if accepted_index_domain != "all_nonnegative_integers":
+            raise RuntimeError(
+                "Procedural AgentMemoryGym stream must accept all non-negative indices"
+            )
+        if not isinstance(stream, Mapping):
+            raise RuntimeError(
+                "Procedural AgentMemoryGym stream metadata is missing"
+            )
+        expected_stream_values = {
+            "tasks_per_seed_epoch": semantic_period_tasks,
+            "orbits_per_seed_epoch": semantic_period_orbits,
+            seed_epoch_boundary_field: True,
+            "seed_epoch_zero_uses_base_seed": True,
+            "collision_free_within_complete_seed_epoch": True,
+            "semantic_uniqueness_guaranteed_through_task_index": (
+                semantic_period_tasks - 1
+            ),
+            "cross_seed_epoch_semantic_uniqueness_guaranteed": False,
+        }
+        if any(stream.get(key) != value for key, value in expected_stream_values.items()):
+            raise RuntimeError(
+                "Procedural AgentMemoryGym stream epoch metadata is inconsistent"
+            )
+    elif stream is not None:
+        raise RuntimeError(
+            "Procedural AgentMemoryGym fixed windows must not expose stream metadata"
+        )
+    return provider
+
+
+def _validate_procedural_metadata(metadata: Mapping[str, Any]) -> None:
+    _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_natural_chain_provider_v4",
+    )
+
+
+def _validate_filesystem_sandbox_metadata(metadata: Mapping[str, Any]) -> None:
+    limits = metadata.get("workspace_limits")
+    if (
+        not isinstance(limits, Mapping)
+        or not FILESYSTEM_WORKSPACE_LIMIT_FIELDS.issubset(limits)
+        or any(
+            type(limits[name]) is not int or limits[name] <= 0
+            for name in FILESYSTEM_WORKSPACE_LIMIT_FIELDS
+        )
+    ):
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym workspace_limits are incomplete or invalid"
+        )
+    if limits["default_timeout_ms"] > limits["max_timeout_ms"]:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym default timeout exceeds its maximum"
+        )
+    if limits["max_file_bytes"] > limits["max_total_bytes"]:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym file limit exceeds workspace capacity"
+        )
+
+    sandbox = metadata.get("workspace_sandbox")
+    if not isinstance(sandbox, Mapping):
+        raise RuntimeError("Filesystem AgentMemoryGym requires workspace_sandbox")
+    mismatches = []
+    for field, expected in FILESYSTEM_SANDBOX_FIELDS.items():
+        observed = sandbox.get(field)
+        if field in FILESYSTEM_SANDBOX_BOOLEAN_FIELDS:
+            matches = type(observed) is bool and observed is expected
+        elif field == "uid_lease_slots":
+            matches = type(observed) is int and observed == expected
+        else:
+            matches = observed == expected
+        if not matches:
+            mismatches.append(field)
+    if mismatches:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym workspace_sandbox is inconsistent: "
+            + ", ".join(sorted(mismatches))
+        )
+
+    observed_sha256 = sandbox.get("ripgrep_sha256")
+    expected_sha256 = sandbox.get("ripgrep_expected_sha256")
+    if (
+        not isinstance(observed_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", observed_sha256) is None
+        or expected_sha256 != observed_sha256
+    ):
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym workspace_sandbox has an invalid ripgrep pin"
+        )
+    version = sandbox.get("ripgrep_version")
+    if not isinstance(version, str) or not version.strip():
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym workspace_sandbox lacks a ripgrep version"
+        )
+    fingerprint = sandbox.get("ripgrep_startup_fingerprint")
+    if (
+        not isinstance(fingerprint, Mapping)
+        or not FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS.issubset(fingerprint)
+        or any(
+            type(fingerprint[name]) is not int or fingerprint[name] < 0
+            for name in FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS
+        )
+        or any(
+            fingerprint[name] <= 0
+            for name in FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS - {"device"}
+        )
+    ):
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym workspace_sandbox has an invalid ripgrep fingerprint"
+        )
+
+    resources = sandbox.get("resource_limits")
+    if (
+        not isinstance(resources, Mapping)
+        or not FILESYSTEM_SANDBOX_RESOURCE_FIELDS.issubset(resources)
+        or any(
+            type(resources[name]) is not int or resources[name] <= 0
+            for name in FILESYSTEM_SANDBOX_RESOURCE_FIELDS
+        )
+    ):
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym workspace_sandbox resource_limits are invalid"
+        )
+    for name in FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS:
+        if resources[name] != limits[name]:
+            raise RuntimeError(
+                f"Filesystem AgentMemoryGym sandbox/workspace limit mismatch: {name}"
+            )
+    if resources["workspace_bytes"] != limits["max_total_bytes"]:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym sandbox workspace_bytes mismatch"
+        )
+    if (
+        resources["workspace_inodes"]
+        != limits["max_files"] + limits["max_directories"] + 1
+    ):
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym sandbox workspace_inodes mismatch"
+        )
+
+
+def _validate_filesystem_metadata(metadata: Mapping[str, Any]) -> None:
+    surface = metadata.get("surface")
+    contract = FILESYSTEM_SURFACE_CONTRACTS.get(surface)
+    if contract is None:
+        raise RuntimeError("Unsupported filesystem AgentMemoryGym surface")
+    expected = {
+        "memory_prompt_mode": NATURAL_FILESYSTEM_PROMPT_MODE,
+        "memory_management": "policy_managed_persistent_workspace",
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_bash_only_v2",
+        "workspace_persistence": "episode_across_sessions",
+        "workspace_episode_isolation": True,
+        "workspace_shell_enabled": True,
+        "workspace_apply_patch_enabled": False,
+        "workspace_host_path_exposed": False,
+        "source_pairing": contract["source_pairing"],
+        "tasks_per_orbit": contract["tasks_per_orbit"],
+        "workspace_prompt_family": contract["prompt_family"],
+        "workspace_seed_contract": contract["seed_contract"],
+        "workspace_evaluation_contract": contract["evaluation_contract"],
+    }
+    mismatches = []
+    for key, expected_value in expected.items():
+        observed = metadata.get(key)
+        if (
+            key == "workspace_seed_contract"
+            and expected_value == "none"
+            and observed is None
+        ):
+            observed = expected_value
+        if type(expected_value) is bool:
+            matches = type(observed) is bool and observed is expected_value
+        else:
+            matches = observed == expected_value
+        if not matches:
+            mismatches.append(key)
+    if mismatches:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym metadata is inconsistent: "
+            + ", ".join(mismatches)
+        )
+    observed_ops = metadata.get("workspace_tool_ops")
+    if not isinstance(observed_ops, (list, tuple)) or {
+        str(value) for value in observed_ops
+    } != {"BASH"}:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym must expose exactly bash"
+        )
+    reward_contract = metadata.get("reward_contract")
+    if not isinstance(reward_contract, Mapping):
+        raise RuntimeError("Filesystem AgentMemoryGym metadata requires reward_contract")
+    for field in (
+        "workspace_action_reward",
+        "bash_reward",
+    ):
+        value = reward_contract.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != 0.0:
+            raise RuntimeError(
+                f"Filesystem AgentMemoryGym requires zero {field}"
+            )
+    if reward_contract.get("memory_specific_shaping") != "none":
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym must disable memory-specific shaping"
+        )
+    _validate_filesystem_sandbox_metadata(metadata)
+    provider = metadata.get("provider")
+    if not isinstance(provider, Mapping):
+        raise RuntimeError("Filesystem AgentMemoryGym metadata requires provider")
+    provider_expected = {
+        "schema": contract["provider_schema"],
+        "tasks_per_orbit": contract["tasks_per_orbit"],
+        "candidate_count_per_phase": contract["candidate_count_per_phase"],
+    }
+    provider_mismatches = [
+        key
+        for key, expected_value in provider_expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if provider_mismatches:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym provider contract is inconsistent: "
+            + ", ".join(f"provider {key}" for key in provider_mismatches)
+        )
+    control = metadata.get("workspace_intervention_control")
+    expected_arms = ["correct", "blank", "swapped", "no_workspace"]
+    if surface == DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_SURFACE:
+        expected_arms = ["correct", "blank", "no_workspace"]
+    elif surface == RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE:
+        expected_arms.insert(3, "stale")
+    if (
+        not isinstance(control, Mapping)
+        or control.get("contract")
+        != "authenticated_session_boundary_counterfactual_copy_v1"
+        or control.get("allowed_arms") != expected_arms
+        or control.get("boundary_session_index")
+        != contract["boundary_session_index"]
+        or control.get("source_state") != contract["source_state"]
+        or control.get("authenticated_export") is not True
+        or control.get("hidden_answer_injection") is not False
+    ):
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym intervention boundary contract is invalid"
+        )
+    forbidden_legacy_fields = {
+        "ltm_inventory_mode",
+        "ltm_transition_notice_mode",
+        "ltm_inventory_key_max_chars",
+        "ltm_inventory_key_format",
+    }
+    leaked = sorted(forbidden_legacy_fields.intersection(metadata))
+    if leaked:
+        raise RuntimeError(
+            "Filesystem AgentMemoryGym leaks legacy LTM metadata: "
+            + ", ".join(leaked)
+        )
+
+
+def _validate_latent_preference_metadata(metadata: Mapping[str, Any]) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_latent_preference_provider_v1",
+    )
+    expected = {
+        "supporting_evidence_counts": [1, 2, 3],
+        "resolution_step": 1,
+        "preference_hypothesis": "one_value_on_one_natural_attribute_axis",
+        "counterfactual_pairing": True,
+        "application_observation_identity": True,
+        "application_target_flip": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    mismatches = [
+        key for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Latent-preference AgentMemoryGym provider metadata is inconsistent: "
+            + ", ".join(mismatches)
+        )
+
+
+def _validate_recency_override_metadata(metadata: Mapping[str, Any]) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_recency_override_provider_v1",
+    )
+    expected = {
+        "phase_schedule": [
+            "evidence",
+            "application",
+            "override",
+            "application",
+            "application",
+            "application",
+        ],
+        "override_phase_index": 2,
+        "canonical_memory_key": "user_preference",
+        "counterfactual_pairing": True,
+        "stay_branch": "old preference remains active",
+        "flip_branch": "new preference replaces old canonical state",
+        "update_contract": "UPDATE same memory_id or DELETE old then ADD new",
+        "application_observation_identity": True,
+        "application_target_flip": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    mismatches = [
+        key
+        for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Recency-override AgentMemoryGym provider metadata is inconsistent: "
+            + ", ".join(mismatches)
+        )
+
+
+def _validate_distractor_robustness_metadata(
+    metadata: Mapping[str, Any],
+) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_distractor_robustness_provider_v1",
+    )
+    expected = {
+        "counterfactual_pairing": True,
+        "branch_order": ["clean", "distracted"],
+        "correct_memory_preloaded": False,
+        "correct_memory_policy_authored_after_evidence": True,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "initial_memory_inventory_visible": False,
+        "strict_top1_certified": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    mismatches = [
+        key for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Distractor-robustness AgentMemoryGym provider metadata is "
+            "inconsistent: " + ", ".join(mismatches)
+        )
+
+
+def _validate_compositional_recall_metadata(
+    metadata: Mapping[str, Any],
+) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_compositional_recall_provider_v1",
+        tasks_per_orbit=4,
+        seed_epoch_boundary_field="factorial_orbit_never_crosses_seed_epoch",
+    )
+    expected = {
+        "factorial_coordinates": [
+            ["token_a", "identity"],
+            ["token_a", "swapped"],
+            ["token_b", "identity"],
+            ["token_b", "swapped"],
+        ],
+        "canonical_memory_count": 2,
+        "retrieve_policy": "query_top1",
+        "required_sequential_retrievals": 2,
+        "memory_id_lookup_allowed": False,
+        "ltm_inventory_visible": False,
+        "leave_one_memory_out_certified": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    mismatches = [
+        key for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Compositional-recall AgentMemoryGym provider metadata is "
+            "inconsistent: " + ", ".join(mismatches)
+        )
+
+
+def _validate_negative_constraint_metadata(
+    metadata: Mapping[str, Any],
+) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_negative_constraint_provider_v1",
+        tasks_per_orbit=3,
+        candidate_count_per_phase=3,
+        seed_epoch_boundary_field=(
+            "counterfactual_orbit_never_crosses_seed_epoch"
+        ),
+    )
+    expected = {
+        "distinct_values_per_phase": 3,
+        "counterfactual_branches": 3,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "initial_memory_inventory_visible": False,
+        "purchase_receipt_asin_verification": True,
+        "rules_only": False,
+        "native_certified": True,
+        "training_ready": True,
+    }
+    mismatches = [
+        key
+        for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Negative-constraint AgentMemoryGym provider metadata is inconsistent: "
+            + ", ".join(mismatches)
+        )
+
+
+def _validate_intent_clarification_metadata(
+    metadata: Mapping[str, Any],
+) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_intent_clarification_provider_v1",
+    )
+    expected = {
+        "counterfactual_pairing": True,
+        "pre_ask_observation_identity": True,
+        "all_targets_flip_after_clarification": True,
+        "required_action": "ASK",
+        "clarification_event": "CLARIFY",
+        "ask_allowed_session": 0,
+        "max_successful_asks": 1,
+        "purchase_before_clarification_allowed": False,
+        "canonical_memory_count": 1,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "ltm_inventory_visible": False,
+        "training_ready": True,
+    }
+    mismatches = [
+        key for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Intent-clarification AgentMemoryGym provider metadata is "
+            "inconsistent: " + ", ".join(mismatches)
+        )
+
+
+def _validate_selective_memory_use_metadata(
+    metadata: Mapping[str, Any],
+) -> None:
+    provider = _validate_programmatic_metadata(
+        metadata,
+        provider_schema="agentmemory_verified_selective_memory_use_provider_v1",
+        tasks_per_orbit=4,
+        seed_epoch_boundary_field="factorial_orbit_never_crosses_seed_epoch",
+    )
+    expected = {
+        "memory_required_fraction": 0.5,
+        "memory_not_required_fraction": 0.5,
+        "required_branch_seeded_memory_state": "current",
+        "not_required_branch_seeded_memory_state": "stale_opposite",
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "ltm_inventory_visible": False,
+        "memory_action_positive_shaping_allowed": False,
+        "unnecessary_memory_action_penalty": -0.01,
+        "memory_required_without_memory_counterfactually_ambiguous": True,
+        "memory_not_required_current_request_explicit": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    mismatches = [
+        key
+        for key, expected_value in expected.items()
+        if provider.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Selective-memory-use AgentMemoryGym provider metadata is "
+            "inconsistent: " + ", ".join(mismatches)
+        )
+
+
+def build_filesystem_conversation_start(
+    action_format: ActionFormat,
+    *,
+    surface: str,
+) -> tuple[ConversationMessage, ConversationMessage]:
+    if surface not in FILESYSTEM_WEBSHOP_SURFACES:
+        raise ValueError(f"Unsupported filesystem AgentMemoryGym surface: {surface!r}")
+
+
+    _ = action_format
+    interface = (
+        "You are operating a programmatically generated AgentMemoryGym WebShop "
+        "task with six shopping sessions and a private persistent workspace. "
+        + QWEN_SINGLE_TOOL_CALL_CONTRACT
+        + "\n"
+        + WORKSPACE_SHELL_CONTRACT
+        + "\n\n"
+        "The WebShop backend exposes only the `search` and `click` functions through "
+        "the complete Qwen XML envelope above. Use the search function with exactly "
+        "one non-empty keywords string. Use the click function with exactly "
+        "one non-empty item string copied from a currently clickable value; calling "
+        "click with item `Buy Now` commits the current product. A failed purchase "
+        "ends the episode without revealing the expected answer.\n\n"
+        "Search example:\n<tool_call>\n<function=search>\n"
+        "<parameter=keywords>wireless headphones</parameter>\n"
+        "</function>\n</tool_call>\n\n"
+        "Click example:\n<tool_call>\n<function=click>\n"
+        "<parameter=item>Buy Now</parameter>\n"
+        "</function>\n</tool_call>\n\n"
+        "Workspace shell example:\n<tool_call>\n<function=bash>\n"
+        "<parameter=command>cat .agent_memory/notes.md</parameter>\n"
+        "</function>\n</tool_call>\n\n"
+        "Workspace Add File example:\n<tool_call>\n<function=bash>\n"
+        "<parameter=command>cat >> .agent_memory/notes.md <<'EOF'\nConfirmed example attribute: example value\nConfirmed example attribute: second value\nEOF</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "When a task says Add File, append the note with a quoted here-document "
+        "in one bash call; when several notes are pending, put all "
+        "their lines in the same here-document. For an actual shopping note, use the exact "
+        "full `Confirmed <field>: <value>` line from the selected approved card; a "
+        "product title is not a field/value note.\n\n"
+        "The workspace persists across shopping sessions within this episode and is "
+        "reset between episodes. The shell is networkless and resource-bounded; paths "
+        "stay inside the workspace. Workspace actions have zero task reward and are "
+        "optional outside a context boundary. At each shopping-session boundary, use "
+        "one normal XML bash function call to overwrite "
+        "`.agent_memory/CONTINUATION.md`; only a verified non-empty write lets the "
+        "wrapper remove old messages. Then read that file through one normal XML "
+        "bash call in the new context.\n\n"
+        "Workspace checkpoint example (overwrite the handoff slot, then read "
+        "it back in the new context):\n<tool_call>\n<function=bash>\n"
+        "<parameter=command>mkdir -p .agent_memory && cat > .agent_memory/CONTINUATION.md <<'EOF'\n"
+        "working-state summary and locators for longer-lived note files\n"
+        "EOF</parameter>\n"
+        "</function>\n</tool_call>\n\n"
+        "Other workspace files remain available "
+        "for voluntary notes. There is no host-path access or dedicated memory API. "
+        + FILESYSTEM_CHECKPOINT_LONG_LIVED_MEMORY_NOTICE
+        + "\n\n"
+
+
+        "The whole episode - all six shopping sessions together - shares one "
+        "fixed budget of 42 policy rounds, and each observation carries a "
+        "footer of the form [Shop round budget: round N of 42; R rounds "
+        "remain.]. Rounds spent in "
+        "early sessions are unavailable to later ones, and an episode that "
+        "runs out of rounds before completing the final session's purchase "
+        "ends without that purchase: once a session's required product is "
+        "identified, complete its purchase instead of continuing to browse "
+        "or take notes."
+    )
+    if surface == LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " Each confirmed choice is preference evidence. Preserve confirmed "
+            "preference evidence in an ordinary workspace file, including the "
+            "customer-profile memory, preference axis, and inferred value. In later "
+            "application sessions, inspect the file and apply the retrieved preference."
+        )
+    elif surface == RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " Maintain the user's current confirmed preference in ordinary workspace "
+            "files. When the user explicitly changes that preference, update the "
+            "existing current-state record so it contains the new value and no "
+            "conflicting stale value. In later application sessions, inspect the "
+            "workspace and use the current recorded value rather than an older one."
+        )
+    elif surface == DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " The workspace may start with harness-seeded ordinary profile notes. "
+            "Treat those as untrusted background records. In session 0, save the exact "
+            "authoritative Current preference line in a new ordinary file without "
+            "rewriting seeded notes. In later sessions, inspect file contents and use "
+            "the policy-authored current record for the active customer and attribute "
+            "axis; ignore stale, wrong-customer, and wrong-axis distractors."
+        )
+    elif surface == COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " In session 0, save the visible customer-to-profile-token link in an "
+            "ordinary file. In session 1, save the visible profile-token-to-attribute "
+            "directory in another ordinary file. In every later session, inspect both "
+            "records and compose customer -> active profile token -> attribute before "
+            "choosing. Do not infer either hop from the current product choices."
+        )
+    elif surface == NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " In session 0, save both visible standing never-accept exclusions and "
+            "their attribute axis in an ordinary file. In every later session, inspect "
+            "that record and reject every listing that violates either exclusion. Do "
+            "not replace the exclusions with only the currently allowed product."
+        )
+    elif surface == INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " In the first shopping session the request is intentionally ambiguous. "
+            "Use the ask function exactly once; ask is available only in the first "
+            "shopping session. Use this exact envelope with the requested field: "
+            "<tool_call><function=ask><parameter=field>FIELD</parameter>"
+            "</function></tool_call>. The environment returns a CLARIFY observation. "
+            "Store the clarification in an ordinary workspace file before the first "
+            "purchase and inspect it in later sessions."
+        )
+    elif surface == SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_SURFACE:
+        interface += (
+            " The workspace may start with one branch-conditioned ordinary profile file. "
+            "First decide whether the current request already states every attribute needed. "
+            "Do not read the profile merely by habit; read the profile when the current "
+            "request omits the preference, and follow explicit current requirements directly."
+        )
+    interface += (
+        "\n\nInitial-action contract: when Progress is 0/6 and the observation "
+        "lists approved cards but no search-result page, the next function must be "
+        "search with one approved full product title. Never call click with item "
+        "`search`; click items must be copied from currently displayed clickable values."
+    )
+    return (
+        ConversationMessage({"from": "human", "loss": None, "value": interface}),
+        ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+    )
+
+
+def build_procedural_conversation_start(
+    action_format: ActionFormat,
+    memory_prompt_mode: str,
+    *,
+    surface: str = PROCEDURAL_WEBSHOP_SURFACE,
+) -> tuple[ConversationMessage, ConversationMessage]:
+    if memory_prompt_mode not in MEMORY_PROMPT_MODES:
+        raise ValueError(
+            "memory_prompt_mode must be one of: "
+            + ", ".join(MEMORY_PROMPT_MODES)
+            + "."
+        )
+    if surface in FILESYSTEM_WEBSHOP_SURFACES:
+        if memory_prompt_mode != NATURAL_FILESYSTEM_PROMPT_MODE:
+            raise ValueError(
+                "The filesystem surface requires memory_prompt_mode="
+                f"{NATURAL_FILESYSTEM_PROMPT_MODE!r}."
+            )
+        return build_filesystem_conversation_start(
+            action_format,
+            surface=surface,
+        )
+    if memory_prompt_mode == NATURAL_FILESYSTEM_PROMPT_MODE:
+        raise ValueError(
+            "natural_filesystem prompt mode is only valid for a filesystem surface."
+        )
+    interface = (
+        "You are operating a programmatically generated AgentMemoryGym WebShop "
+        "training task with six separate shopping sessions. Native shopping "
+        "actions are search[keywords] and click[current clickable value]; "
+        "click[Buy Now] commits the current product. A successful purchase clears "
+        "the native page and short-term S*/C* context before the next session. "
+        "ADD stores the provided key/value verbatim in hidden long-term memory. "
+        "RETRIEVE exposes matching stored memories as C* context. SUMMARY and "
+        "FILTER operate only on visible S*/C* items. Long-term memory persists "
+        "between sessions but remains hidden until RETRIEVE. A failed purchase "
+        "ends the episode without revealing the expected answer."
+    )
+    if memory_prompt_mode in {"neutral_horizon", "neutral_horizon_responsibility"}:
+        interface += " " + NEUTRAL_HORIZON_CONTEXT
+    if memory_prompt_mode == "neutral_horizon_responsibility":
+        interface += " " + CROSS_SESSION_MEMORY_RESPONSIBILITY
+    if memory_prompt_mode == LATENT_PREFERENCE_PROMPT_MODE:
+        interface += " " + LATENT_PREFERENCE_SOP
+    elif memory_prompt_mode == SELECTIVE_MEMORY_PROMPT_MODE:
+        interface += " " + SELECTIVE_MEMORY_SOP
+    elif memory_prompt_mode == "legacy":
+        interface += (
+            " Preserve and retrieve any visible product attribute that a later "
+            "customer rule needs; the environment does not perform memory actions "
+            "for you and does not require a particular key or schema."
+        )
+    if surface in QUERY_TOP1_WEBSHOP_SURFACES:
+        interface += " " + QUERY_TOP1_RETRIEVAL_CONTRACT
+    if surface == INTENT_CLARIFICATION_WEBSHOP_SURFACE:
+        interface += " " + INTENT_CLARIFICATION_CONTRACT
+
+    function_descriptions = list(AGENTMEMORY_FUNCTION_DESCRIPTION)
+    if surface in QUERY_TOP1_WEBSHOP_SURFACES:
+        function_descriptions = [
+            (
+                {
+                    **description,
+                    "description": (
+                        "Match a query against text previously stored with add and "
+                        "expose exactly the highest-ranked memory as active context."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Retrieval query.",
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                }
+                if description["name"] == "retrieve"
+                else description
+            )
+            for description in function_descriptions
+        ]
+    if surface == INTENT_CLARIFICATION_WEBSHOP_SURFACE:
+        function_descriptions.append(AGENTMEMORY_ASK_FUNCTION_DESCRIPTION)
+
+    if action_format is ActionFormat.REACT:
+        prompt = (
+            interface
+            + " Reply in exactly this format:\n\nThought:\nbrief reasoning\n\n"
+            "Action:\n<exactly one native bracket action or uppercase "
+            "memory-tool JSON action>"
+        )
+    elif action_format is ActionFormat.FUNCTION_CALLING:
+        prompt = (
+            interface
+            + " Invoke exactly one available function.\n\n"
+            + format_function_call_prompt(function_descriptions)
+        )
+    elif action_format is ActionFormat.CODE_AS_ACTION:
+        prompt = (
+            interface
+            + " Write Python code to call exactly one available function.\n\n"
+            + format_code_as_action_prompt(function_descriptions)
+        )
+    else:
+        raise ValueError(f"Unsupported AgentMemoryGym action format: {action_format}")
+    return (
+        ConversationMessage({"from": "human", "loss": None, "value": prompt}),
+        ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+    )
+
+
+def strip_think_prefix(text: str) -> str:
+
+    matches = list(_THINK_CLOSE_RE.finditer(text))
+    if matches:
+        return text[matches[-1].end():]
+    return text
+
+
+class AgentMemoryAdapter(BaseAdapter):
+    conversation_start_dict = {
+        ActionFormat.REACT: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": "You are operating in AgentMemoryGym on the original MemoryArena WebShop surface. Native shopping actions are search[keywords] and click[current clickable value]; click[Buy Now] commits the current product. ADD stores the provided key/value verbatim in hidden long-term memory. RETRIEVE matches its query against text previously stored with ADD and exposes matches as C* context. SUMMARY and FILTER operate only on visible S*/C* items. A committed purchase that advances the session clears the native page state and S*/C* context; long-term memory remains hidden until RETRIEVE. Once you have selected the current product, use ADD before click[Buy Now] to save one concise memory containing its identity and visible compatibility-relevant attributes. At the start of every later shopping session, use RETRIEVE to expose the relevant prior-purchase memories before choosing a compatible product. The environment does not perform these memory actions for you and does not reject an otherwise correct purchase when ADD was skipped. A purchase that fails verification ends the episode without revealing the verifier reason. Reply in exactly this format:\n\nThought:\nbrief reasoning\n\nAction:\n<exactly one native bracket action or uppercase memory-tool JSON action>",
+                }
+            ),
+            ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+        ),
+        ActionFormat.FUNCTION_CALLING: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": "You are operating in AgentMemoryGym on the original MemoryArena WebShop surface. Long-term memory is hidden unless you retrieve it. Before committing the selected product, use add to save its identity and visible compatibility-relevant attributes; at the start of every later shopping session, use retrieve to expose the relevant prior-purchase memories before choosing. The environment does not enforce add-before-buy. Invoke exactly one available function.\n\n"
+                    + format_function_call_prompt(AGENTMEMORY_FUNCTION_DESCRIPTION),
+                }
+            ),
+            ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+        ),
+        ActionFormat.CODE_AS_ACTION: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": "You are operating in AgentMemoryGym on the original MemoryArena WebShop surface. Long-term memory is hidden unless you retrieve it. Before committing the selected product, use add to save its identity and visible compatibility-relevant attributes; at the start of every later shopping session, use retrieve to expose the relevant prior-purchase memories before choosing. The environment does not enforce add-before-buy. Write Python code to call exactly one available function.\n\n"
+                    + format_code_as_action_prompt(AGENTMEMORY_FUNCTION_DESCRIPTION),
+                }
+            ),
+            ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+        ),
+    }
+    neutral_conversation_start_dict = {
+        ActionFormat.REACT: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": "You are operating in AgentMemoryGym on the original MemoryArena WebShop surface. Native shopping actions are search[keywords] and click[current clickable value]; click[Buy Now] commits the current product. ADD stores the provided key/value verbatim in hidden long-term memory. RETRIEVE matches its query against text previously stored with ADD and exposes matches as C* context. SUMMARY and FILTER operate only on visible S*/C* items. A committed purchase that advances the session clears the native page state and S*/C* context; long-term memory remains hidden until RETRIEVE. A purchase that fails verification ends the episode without revealing the verifier reason. Reply in exactly this format:\n\nThought:\nbrief reasoning\n\nAction:\n<exactly one native bracket action or uppercase memory-tool JSON action>",
+                }
+            ),
+            ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+        ),
+        ActionFormat.FUNCTION_CALLING: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": "You are operating in AgentMemoryGym on the original MemoryArena WebShop surface. Long-term memory persists across shopping sessions and is hidden unless retrieve exposes it. The available functions define the browser and memory interfaces. Invoke exactly one available function.\n\n"
+                    + format_function_call_prompt(AGENTMEMORY_FUNCTION_DESCRIPTION),
+                }
+            ),
+            ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+        ),
+        ActionFormat.CODE_AS_ACTION: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": "You are operating in AgentMemoryGym on the original MemoryArena WebShop surface. Long-term memory persists across shopping sessions and is hidden unless retrieve exposes it. The available functions define the browser and memory interfaces. Write Python code to call exactly one available function.\n\n"
+                    + format_code_as_action_prompt(AGENTMEMORY_FUNCTION_DESCRIPTION),
+                }
+            ),
+            ConversationMessage({"from": "gpt", "loss": False, "value": "Ok."}),
+        ),
+    }
+    neutral_horizon_conversation_start_dict = {
+        action_format: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": prompt[0]["value"] + " " + NEUTRAL_HORIZON_CONTEXT,
+                }
+            ),
+            prompt[1],
+        )
+        for action_format, prompt in neutral_conversation_start_dict.items()
+    }
+    neutral_horizon_responsibility_conversation_start_dict = {
+        action_format: (
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": prompt[0]["value"]
+                    + " "
+                    + CROSS_SESSION_MEMORY_RESPONSIBILITY,
+                }
+            ),
+            prompt[1],
+        )
+        for action_format, prompt in neutral_horizon_conversation_start_dict.items()
+    }
+
+    @classmethod
+    def conversation_start_for_mode(
+        cls,
+        action_format: ActionFormat,
+        memory_prompt_mode: str,
+    ) -> tuple[ConversationMessage, ConversationMessage]:
+        if memory_prompt_mode not in MEMORY_PROMPT_MODES:
+            raise ValueError(
+                "memory_prompt_mode must be one of: "
+                + ", ".join(MEMORY_PROMPT_MODES)
+                + "."
+            )
+        if memory_prompt_mode == "neutral_horizon_responsibility":
+            prompts = cls.neutral_horizon_responsibility_conversation_start_dict
+        elif memory_prompt_mode == "neutral_horizon":
+            prompts = cls.neutral_horizon_conversation_start_dict
+        elif memory_prompt_mode == "neutral":
+            prompts = cls.neutral_conversation_start_dict
+        else:
+            prompts = cls.conversation_start_dict
+        return prompts[action_format]
+
+    @staticmethod
+    def parse_react(text: str) -> ActionWithTought:
+
+
+        action_text = strip_think_prefix(text)
+        think_thought = ""
+        if action_text != text:
+            removed = text[: len(text) - len(action_text)]
+            think_thought = re.sub(r"</?think\s*>", "", removed, flags=re.IGNORECASE).strip()
+
+        if "Action:" not in action_text:
+            bare_action = extract_bare_env_action(action_text)
+            if bare_action:
+                return ActionWithTought(thought=think_thought, action=bare_action)
+        parsed = BaseAdapter.parse_react(action_text)
+        if parsed.action:
+            try:
+                action_name, arguments = parse_env_action(parsed.action)
+                return ActionWithTought(
+                    thought=parsed.thought or think_thought,
+                    action=format_action(action_name, arguments),
+                )
+            except Exception:
+                return ActionWithTought(
+                    thought=parsed.thought or think_thought,
+                    action="",
+                )
+        bare_action = extract_bare_env_action(action_text)
+        if bare_action:
+            return ActionWithTought(thought=parsed.thought or think_thought, action=bare_action)
+        return ActionWithTought(thought=parsed.thought or think_thought, action="")
+
+    @staticmethod
+    def parse_function_calling(text: str) -> ActionWithTought:
+        fn_call = json.loads("{" + text.split("{", 1)[-1].rsplit("}", 1)[0] + "}", strict=False)
+        thought = fn_call["thought"]
+        function_name = fn_call["function_name"]
+        arguments = fn_call["arguments"]
+        action_name = FUNCTION_TO_ACTION.get(str(function_name).lower())
+        if action_name is None:
+            raise ValueError(f"Invalid function name: {function_name}")
+        return ActionWithTought(thought=thought, action=format_action(action_name, arguments))
+
+    @staticmethod
+    def to_function_calling(action_with_thought: ActionWithTought) -> str:
+        action_name, arguments = parse_env_action(action_with_thought.action)
+        function_name = action_name.lower()
+        return json.dumps(
+            {
+                "thought": action_with_thought.thought,
+                "function_name": function_name,
+                "arguments": arguments,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @staticmethod
+    def parse_code_as_action(text: str) -> ActionWithTought:
+        code = extract_python_code_blocks(text)
+        action = eval(code, {}, build_code_action_functions())
+        thought = parse_python_code_comments(code)
+        return ActionWithTought(thought=thought, action=action)
+
+    @staticmethod
+    def to_code_as_action(action_with_thought: ActionWithTought) -> str:
+        action_name, arguments = parse_env_action(action_with_thought.action)
+        function_name = action_name.lower()
+        return f"```python\n# {action_with_thought.thought}\n{function_name}(**{repr(arguments)})\n```"
+
+
+def _normalize_qwen_workspace_parameter_name(raw: str) -> str:
+    name = raw.strip()
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in {"'", '"'}:
+        name = name[1:-1].strip()
+    return name.lower()
+
+
+def _parse_qwen_workspace_string(raw: str, *, name: str) -> str:
+    value: Any = raw.strip()
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        decoded = value
+    if not isinstance(decoded, str) or not decoded.strip():
+        raise ValueError(f"workspace {name} must be a non-empty string")
+    return decoded.strip()
+
+
+def parse_qwen_workspace_action(
+    action: str,
+) -> tuple[str, dict[str, Any]] | None:
+
+
+    match = QWEN_WORKSPACE_TOOL_CALL_RE.fullmatch(action.strip())
+    if match is None:
+        return None
+    action_name = match.group(1).strip().lower()
+    if action_name not in FILESYSTEM_ACTION_NAMES:
+        raise ValueError(
+            "Qwen XML is available only for bash; "
+            "native WebShop actions remain bare bracket actions."
+        )
+    body = match.group(2).strip()
+    arguments: dict[str, str] = {}
+    for raw_key, raw_value in QWEN_WORKSPACE_PARAMETER_RE.findall(body):
+        key = _normalize_qwen_workspace_parameter_name(raw_key)
+        if not key:
+            raise ValueError("workspace tool_call parameter name must be non-empty")
+        if key in arguments:
+            raise ValueError(f"workspace tool_call repeats parameter {key!r}")
+        arguments[key] = raw_value.strip()
+
+
+    if body.lstrip().startswith("{"):
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("bash body must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("bash body must be a JSON object")
+        return action_name, payload
+
+    allowed = {"command"}
+    if "command" not in arguments or not set(arguments) <= allowed:
+        raise ValueError(
+            "bash accepts only the command parameter; "
+            "remove workdir and timeout_ms"
+        )
+    payload: dict[str, Any] = {
+        "command": _parse_qwen_workspace_string(
+            arguments["command"], name="command"
+        )
+    }
+    if "workdir" in arguments:
+        payload["workdir"] = _parse_qwen_workspace_string(
+            arguments["workdir"], name="workdir"
+        )
+    if "timeout_ms" in arguments:
+        try:
+            payload["timeout_ms"] = int(arguments["timeout_ms"])
+        except ValueError as exc:
+            raise ValueError(
+                "bash timeout_ms must be a positive integer"
+            ) from exc
+        if payload["timeout_ms"] < 1:
+            raise ValueError(
+                "bash timeout_ms must be a positive integer"
+            )
+    return action_name, payload
+
+
+def format_filesystem_action(action_name: str, arguments: dict[str, Any]) -> str:
+    if action_name == "search":
+        return _format_native_bracket_action(action_name, arguments, "keywords")
+    if action_name == "click":
+        return _format_native_bracket_action(action_name, arguments, "item")
+    if action_name == "bash":
+        if not isinstance(arguments, dict):
+            raise ValueError("bash arguments must be an object.")
+        return "bash " + json.dumps(arguments, ensure_ascii=False)
+    if action_name == "ask":
+        if not isinstance(arguments, dict) or set(arguments) != {"field"}:
+            raise ValueError("ask requires exactly field:string.")
+        return "ASK " + json.dumps(
+            {"field": _require_function_text(arguments, "field")},
+            ensure_ascii=False,
+        )
+    raise ValueError(f"Unsupported filesystem AgentMemoryGym action: {action_name}")
+
+
+def _invalid_qwen_policy_action(
+    reason: str,
+) -> tuple[str, dict[str, Any]]:
+    return QWEN_INVALID_ACTION_SENTINEL, {
+        "tool_contract": "qwen3_xml_single_call_v1",
+        "tool_parser": "qwen3_coder",
+        "tool_parser_normalized": False,
+        "tool_parser_error": reason,
+        "submitted_action": QWEN_INVALID_ACTION_SENTINEL,
+    }
+
+
+def normalize_filesystem_webshop_policy_action(
+    action: str,
+    *,
+    allow_ask: bool = False,
+) -> tuple[str, dict[str, Any]]:
+
+
+    schemas = list(_WEBSHOP_QWEN_TOOL_SCHEMAS)
+    if allow_ask:
+        schemas.append(_WEBSHOP_QWEN_ASK_TOOL_SCHEMA)
+    parsed = parse_single_qwen3_tool_call(action, tool_schemas=schemas)
+    if parsed is None:
+        return _invalid_qwen_policy_action(
+            "expected_complete_qwen_xml_tool_call"
+        )
+    name = parsed.name
+    arguments = dict(parsed.arguments)
+    try:
+        if name == "search":
+            if set(arguments) != {"keywords"}:
+                raise ValueError("search requires exactly keywords")
+            value = arguments["keywords"]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("search keywords must be a non-empty string")
+            arguments = {"keywords": value.strip()}
+        elif name == "click":
+            if set(arguments) != {"item"}:
+                raise ValueError("click requires exactly item")
+            value = arguments["item"]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("click item must be a non-empty string")
+            arguments = {"item": value.strip()}
+        elif name == "ask" and allow_ask:
+            if set(arguments) != {"field"}:
+                raise ValueError("ask requires exactly field")
+            value = arguments["field"]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("ask field must be a non-empty string")
+            arguments = {"field": value.strip()}
+        elif name == "bash":
+            allowed = {"command"}
+            if "command" not in arguments or not set(arguments) <= allowed:
+                raise ValueError(
+                    "bash accepts only the command parameter; "
+                    "remove workdir and timeout_ms"
+                )
+            command = arguments["command"]
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("bash command must be a non-empty string")
+            normalized: dict[str, Any] = {
+                "command": command,
+                "workdir": ".",
+                "timeout_ms": 10000,
+            }
+            if "workdir" in arguments:
+                workdir = arguments["workdir"]
+                if (
+                    not isinstance(workdir, str)
+                    or not workdir.strip()
+                    or "\x00" in workdir
+                ):
+                    raise ValueError("bash workdir must be a safe non-empty string")
+                normalized["workdir"] = workdir.strip()
+            if "timeout_ms" in arguments:
+                timeout_ms = arguments["timeout_ms"]
+                if (
+                    isinstance(timeout_ms, bool)
+                    or not isinstance(timeout_ms, int)
+                    or timeout_ms <= 0
+                ):
+                    raise ValueError("bash timeout_ms must be a positive integer")
+                normalized["timeout_ms"] = timeout_ms
+            arguments = normalized
+        else:
+            raise ValueError(f"unsupported WebShop function: {name}")
+        submitted = format_filesystem_action(name, arguments)
+    except (TypeError, ValueError) as exc:
+        return _invalid_qwen_policy_action(str(exc))
+    return submitted, {
+        "tool_contract": "qwen3_xml_single_call_v1",
+        "tool_parser": parsed.parser_name,
+        "tool_parser_normalized": True,
+        "submitted_action": submitted,
+    }
+
+
+def parse_filesystem_env_action(
+    action: str,
+    *,
+    allow_ask: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    cleaned = action.strip()
+    native_action = _parse_native_bracket_action(cleaned)
+    if native_action is not None:
+        action_name, argument = native_action
+        if argument:
+            key = "keywords" if action_name == "search" else "item"
+            return action_name, {key: argument}
+    qwen_workspace_action = parse_qwen_workspace_action(cleaned)
+    if qwen_workspace_action is not None:
+        return qwen_workspace_action
+    json_match = FILESYSTEM_JSON_ACTION_RE.fullmatch(cleaned)
+    if json_match is not None:
+        payload = json.loads(json_match.group(1))
+        if not isinstance(payload, dict):
+            raise ValueError("bash payload must be a JSON object.")
+        return "bash", payload
+    if allow_ask:
+        ask_match = FILESYSTEM_ASK_ACTION_RE.fullmatch(cleaned)
+        if ask_match is not None:
+            payload = json.loads(ask_match.group(1))
+            if not isinstance(payload, dict):
+                raise ValueError("ASK payload must be a JSON object.")
+            return "ask", payload
+    raise ValueError(
+        "Expected one native bracket action or bash JSON action."
+    )
+
+
+def extract_bare_filesystem_action(text: str, *, allow_ask: bool = False) -> str:
+    cleaned = strip_think_prefix(text).strip()
+    if cleaned.endswith("</s>"):
+        cleaned = cleaned[:-4].strip()
+    try:
+        action_name, arguments = parse_filesystem_env_action(
+            cleaned,
+            allow_ask=allow_ask,
+        )
+        return format_filesystem_action(action_name, arguments)
+    except Exception:
+        return ""
+
+
+def parse_filesystem_code_action(code: str, *, allow_ask: bool = False) -> str:
+
+
+    try:
+        module = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        raise ValueError("Filesystem code action must be valid Python syntax.") from exc
+    if len(module.body) != 1 or not isinstance(module.body[0], ast.Expr):
+        raise ValueError("Filesystem code action must contain exactly one function call.")
+    call = module.body[0].value
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        raise ValueError("Filesystem code action must call one registered function.")
+    if call.args:
+        raise ValueError("Filesystem code action accepts keyword arguments only.")
+    function_name = call.func.id
+    action_name = FILESYSTEM_FUNCTION_TO_ACTION.get(function_name.lower())
+    if action_name is None and allow_ask and function_name.lower() == "ask":
+        action_name = "ask"
+    if action_name is None:
+        raise ValueError(f"Invalid filesystem function name: {function_name}")
+    arguments: dict[str, Any] = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            raise ValueError("Filesystem code action does not accept **kwargs expansion.")
+        if keyword.arg in arguments:
+            raise ValueError(
+                f"Filesystem code action repeats argument: {keyword.arg}"
+            )
+        try:
+            arguments[keyword.arg] = ast.literal_eval(keyword.value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                "Filesystem code action arguments must be Python literals."
+            ) from exc
+    try:
+        json.dumps(arguments, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Filesystem code action arguments must be JSON-compatible literals."
+        ) from exc
+    return format_filesystem_action(action_name, arguments)
+
+
+class FilesystemAgentMemoryAdapter(AgentMemoryAdapter):
+
+
+    allow_ask = False
+
+    @classmethod
+    def parse_react(cls, text: str) -> ActionWithTought:
+        action_text = strip_think_prefix(text)
+        think_thought = ""
+        if action_text != text:
+            removed = text[: len(text) - len(action_text)]
+            think_thought = re.sub(
+                r"</?think\s*>", "", removed, flags=re.IGNORECASE
+            ).strip()
+        if "Action:" not in action_text:
+            bare_action = extract_bare_filesystem_action(
+                action_text,
+                allow_ask=cls.allow_ask,
+            )
+            if bare_action:
+                return ActionWithTought(thought=think_thought, action=bare_action)
+        parsed = BaseAdapter.parse_react(action_text)
+        if parsed.action:
+            try:
+                action_name, arguments = parse_filesystem_env_action(
+                    parsed.action,
+                    allow_ask=cls.allow_ask,
+                )
+                return ActionWithTought(
+                    thought=parsed.thought or think_thought,
+                    action=format_filesystem_action(action_name, arguments),
+                )
+            except Exception:
+                return ActionWithTought(
+                    thought=parsed.thought or think_thought,
+                    action="",
+                )
+        bare_action = extract_bare_filesystem_action(
+            action_text,
+            allow_ask=cls.allow_ask,
+        )
+        if bare_action:
+            return ActionWithTought(
+                thought=parsed.thought or think_thought,
+                action=bare_action,
+            )
+        return ActionWithTought(thought=parsed.thought or think_thought, action="")
+
+    @classmethod
+    def parse_function_calling(cls, text: str) -> ActionWithTought:
+        fn_call = json.loads(
+            "{" + text.split("{", 1)[-1].rsplit("}", 1)[0] + "}",
+            strict=False,
+        )
+        function_name = fn_call["function_name"]
+        action_name = FILESYSTEM_FUNCTION_TO_ACTION.get(str(function_name).lower())
+        if action_name is None and cls.allow_ask and str(function_name).lower() == "ask":
+            action_name = "ask"
+        if action_name is None:
+            raise ValueError(f"Invalid filesystem function name: {function_name}")
+        return ActionWithTought(
+            thought=fn_call["thought"],
+            action=format_filesystem_action(action_name, fn_call["arguments"]),
+        )
+
+    @classmethod
+    def to_function_calling(cls, action_with_thought: ActionWithTought) -> str:
+        action_name, arguments = parse_filesystem_env_action(
+            action_with_thought.action,
+            allow_ask=cls.allow_ask,
+        )
+        return json.dumps(
+            {
+                "thought": action_with_thought.thought,
+                "function_name": action_name.lower(),
+                "arguments": arguments,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @classmethod
+    def parse_code_as_action(cls, text: str) -> ActionWithTought:
+        code = extract_python_code_blocks(text)
+        action = parse_filesystem_code_action(code, allow_ask=cls.allow_ask)
+        return ActionWithTought(
+            thought=parse_python_code_comments(code),
+            action=action,
+        )
+
+    @classmethod
+    def to_code_as_action(cls, action_with_thought: ActionWithTought) -> str:
+        action_name, arguments = parse_filesystem_env_action(
+            action_with_thought.action,
+            allow_ask=cls.allow_ask,
+        )
+        return (
+            f"```python\n# {action_with_thought.thought}\n"
+            f"{action_name.lower()}(**{repr(arguments)})\n```"
+        )
+
+
+class IntentClarificationFilesystemAgentMemoryAdapter(FilesystemAgentMemoryAdapter):
+
+
+    allow_ask = True
+
+
+def checkpoint_action_has_multiple_tool_ops(tool_ops: Any) -> bool:
+
+    return bool(
+        isinstance(tool_ops, Sequence)
+        and not isinstance(tool_ops, (str, bytes))
+        and len(tool_ops) > 1
+    )
+
+
+def _workspace_event_matches_current_action(
+    latest_event: Any,
+    tool_ops: Any,
+    *,
+    native_step_after: Any,
+    submitted_action: Any,
+) -> bool:
+
+
+    if (
+        not isinstance(latest_event, Mapping)
+        or not isinstance(tool_ops, Sequence)
+        or isinstance(tool_ops, (str, bytes))
+        or not tool_ops
+        or not isinstance(tool_ops[-1], Mapping)
+        or isinstance(native_step_after, bool)
+        or not isinstance(native_step_after, int)
+    ):
+        return False
+    latest_tool_op = tool_ops[-1]
+    event_step = latest_event.get("step")
+    tool_step = latest_tool_op.get("step")
+    if (
+        isinstance(event_step, bool)
+        or not isinstance(event_step, int)
+        or event_step != tool_step
+        or event_step != native_step_after
+        or str(latest_event.get("op", "")).upper()
+        != str(latest_tool_op.get("op", "")).upper()
+    ):
+        return False
+    event_id = latest_event.get("event_id")
+    tool_event_id = latest_tool_op.get("event_id")
+    event_request_sha256 = latest_event.get("request_sha256")
+    tool_request_sha256 = latest_tool_op.get("request_sha256")
+    expected_request_sha256 = filesystem_workspace_action_request_sha256(
+        submitted_action
+    )
+    return bool(
+        isinstance(event_id, int)
+        and not isinstance(event_id, bool)
+        and event_id == tool_event_id
+        and isinstance(event_request_sha256, str)
+        and len(event_request_sha256) == 64
+        and all(char in "0123456789abcdef" for char in event_request_sha256)
+        and event_request_sha256 == tool_request_sha256
+        and event_request_sha256 == expected_request_sha256
+    )
+
+
+class AgentMemoryEnvClient(BaseEnvClient):
+    adapter_cls = AgentMemoryAdapter
+
+
+    is_v3 = False
+
+    def __init__(
+        self,
+        env_server_base: str,
+        data_len: int | None,
+        *args,
+        timeout: int = 300,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.env_server_base = env_server_base
+        self.timeout = timeout
+        self.metadata = self.get_metadata()
+        self.surface = _required_metadata_text(self.metadata, "surface")
+        self.formal_schema_version = self.metadata.get("formal_schema_version")
+        self.domain_id = self.metadata.get("domain_id")
+        self.system_prompt = self.metadata.get("system_prompt")
+        self.contract_id = self.metadata.get("contract_id")
+        self.contract_sha256 = self.metadata.get("contract_sha256")
+        self.system_prompt_sha256 = self.metadata.get("system_prompt_sha256")
+        self._policy_system_prompt: str | None = None
+        self.memory_prompt_mode: str | None = None
+        self.is_v3 = self.formal_schema_version == FORMAL_SCHEMA_V3
+        self.is_procedural = self.surface in PROGRAMMATIC_WEBSHOP_SURFACES
+        self.is_filesystem = self.surface in FILESYSTEM_WEBSHOP_SURFACES
+        if self.surface == INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_SURFACE:
+            self.adapter_cls = IntentClarificationFilesystemAgentMemoryAdapter
+        elif self.is_filesystem:
+            self.adapter_cls = FilesystemAgentMemoryAdapter
+        else:
+            self.adapter_cls = AgentMemoryAdapter
+        self.is_latent_preference = self.surface in LATENT_PREFERENCE_WEBSHOP_SURFACES
+        self.is_recency_override = self.surface in RECENCY_OVERRIDE_WEBSHOP_SURFACES
+        self.is_distractor_robustness = (
+            self.surface in DISTRACTOR_ROBUSTNESS_WEBSHOP_SURFACES
+        )
+        self.is_compositional_recall = (
+            self.surface in COMPOSITIONAL_RECALL_WEBSHOP_SURFACES
+        )
+        self.is_intent_clarification = self.surface in INTENT_CLARIFICATION_WEBSHOP_SURFACES
+        self.is_selective_memory_use = self.surface in SELECTIVE_MEMORY_USE_WEBSHOP_SURFACES
+        self.is_negative_constraint = (
+            self.surface in NEGATIVE_CONSTRAINT_WEBSHOP_SURFACES
+        )
+        self.is_preference_memory = self.surface in PREFERENCE_WEBSHOP_SURFACES
+        self.requires_latent_preference_sop = (
+            self.surface in LATENT_PREFERENCE_SOP_WEBSHOP_SURFACES
+        )
+        self.requires_selective_memory_sop = (
+            self.surface == SELECTIVE_MEMORY_USE_WEBSHOP_SURFACE
+        )
+        if self.is_v3:
+            _validate_v3_metadata(self.metadata)
+            if self.action_format is not ActionFormat.REACT:
+                raise RuntimeError(
+                    "AgentMemoryGym v3 domains currently require action_format='react'"
+                )
+        elif self.is_procedural:
+            if self.is_filesystem:
+                _validate_filesystem_metadata(self.metadata)
+            if self.is_latent_preference:
+                _validate_latent_preference_metadata(self.metadata)
+            elif self.is_recency_override:
+                _validate_recency_override_metadata(self.metadata)
+            elif self.is_distractor_robustness:
+                _validate_distractor_robustness_metadata(self.metadata)
+            elif self.is_compositional_recall:
+                _validate_compositional_recall_metadata(self.metadata)
+            elif self.is_intent_clarification:
+                _validate_intent_clarification_metadata(self.metadata)
+            elif self.is_selective_memory_use:
+                _validate_selective_memory_use_metadata(self.metadata)
+            elif self.is_negative_constraint:
+                _validate_negative_constraint_metadata(self.metadata)
+            elif self.surface == PROCEDURAL_FILESYSTEM_WEBSHOP_SURFACE:
+                _validate_procedural_metadata(self.metadata)
+            elif not self.is_filesystem:
+                _validate_procedural_metadata(self.metadata)
+            memory_prompt_mode = self.metadata.get("memory_prompt_mode", "legacy")
+            if memory_prompt_mode not in MEMORY_PROMPT_MODES:
+                raise RuntimeError(
+                    "AgentMemoryGym procedural metadata has unsupported "
+                    f"memory_prompt_mode: {memory_prompt_mode!r}"
+                )
+            if self.requires_latent_preference_sop and (
+                memory_prompt_mode != LATENT_PREFERENCE_PROMPT_MODE
+            ):
+                raise RuntimeError(
+                    "AgentMemoryGym surface requires "
+                    f"memory_prompt_mode={LATENT_PREFERENCE_PROMPT_MODE!r}"
+                )
+            if self.is_filesystem and (
+                memory_prompt_mode != NATURAL_FILESYSTEM_PROMPT_MODE
+            ):
+                raise RuntimeError(
+                    "AgentMemoryGym filesystem surface requires "
+                    f"memory_prompt_mode={NATURAL_FILESYSTEM_PROMPT_MODE!r}"
+                )
+            if self.requires_selective_memory_sop and (
+                memory_prompt_mode != SELECTIVE_MEMORY_PROMPT_MODE
+            ):
+                raise RuntimeError(
+                    "AgentMemoryGym selective-memory-use surface requires "
+                    f"memory_prompt_mode={SELECTIVE_MEMORY_PROMPT_MODE!r}"
+                )
+            if (
+                not self.requires_latent_preference_sop
+                and not self.requires_selective_memory_sop
+                and not self.is_filesystem
+                and memory_prompt_mode in {
+                    LATENT_PREFERENCE_PROMPT_MODE,
+                    SELECTIVE_MEMORY_PROMPT_MODE,
+                    NATURAL_FILESYSTEM_PROMPT_MODE,
+                }
+            ):
+                raise RuntimeError(
+                    "AgentMemoryGym natural-chain surface cannot use the "
+                    "specialized memory prompt"
+                )
+            self.memory_prompt_mode = memory_prompt_mode
+        elif self.surface != WEBSHOP_V2_SURFACE:
+            raise RuntimeError(
+                "AgentMemoryGym client received an unsupported legacy surface without "
+                f"the v3 schema: {self.surface!r}"
+            )
+        else:
+            memory_prompt_mode = self.metadata.get("memory_prompt_mode", "legacy")
+            if memory_prompt_mode not in MEMORY_PROMPT_MODES:
+                raise RuntimeError(
+                    "AgentMemoryGym WebShop metadata has unsupported "
+                    f"memory_prompt_mode: {memory_prompt_mode!r}"
+                )
+            if memory_prompt_mode == NATURAL_FILESYSTEM_PROMPT_MODE:
+                raise RuntimeError(
+                    "natural_filesystem prompt mode is only valid for the "
+                    "persistent-workspace surface"
+                )
+            self.memory_prompt_mode = memory_prompt_mode
+        self.data_len = data_len if data_len is not None else int(self.metadata["task_count"])
+        response = requests.post(f"{self.env_server_base}/create", timeout=self.timeout)
+        if response.status_code != 200:
+            raise requests.RequestException(f"Failed to create environment: {response}")
+        created = response.json()
+        self.env_id = created["id"]
+        self.info = {
+            "observation": created["observation"],
+            "reward": created["reward"],
+            "done": created["done"],
+            "env_info": created.get("info", {}),
+            "metadata": self.metadata,
+        }
+        self.last_action_submission: dict[str, Any] | None = None
+        self._reset_policy_transition_state(created.get("info", {}))
+        self.conversation_start = (
+            build_v3_conversation_start(self.metadata)
+            if self.is_v3
+            else build_procedural_conversation_start(
+                self.action_format,
+                self.memory_prompt_mode,
+                surface=self.surface,
+            )
+            if self.is_procedural
+            else self.adapter_cls.conversation_start_for_mode(
+                self.action_format,
+                self.memory_prompt_mode,
+            )
+        )
+
+    def configure_policy_system_prompt(self, prompt: str) -> None:
+
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("AgentMemory policy system prompt must not be empty")
+        normalized = prompt.strip()
+        server_prompt = getattr(self, "system_prompt", None)
+        if self.is_v3 and isinstance(server_prompt, str):
+            if normalized != server_prompt.strip():
+                raise ValueError(
+                    "AgentMemory v3 policy prompt differs from server metadata"
+                )
+        expected_sha256 = getattr(self, "system_prompt_sha256", None)
+        if isinstance(expected_sha256, str):
+            observed = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            if observed != expected_sha256:
+                raise ValueError(
+                    "AgentMemory policy prompt SHA-256 differs from server metadata"
+                )
+        self._policy_system_prompt = normalized
+
+    def policy_framing(self) -> list[dict[str, str]]:
+        if self._policy_system_prompt is None:
+            raise RuntimeError(
+                "AgentMemory formal policy system prompt was not configured"
+            )
+        return [{"role": "system", "content": self._policy_system_prompt}]
+
+    def policy_tool_schemas(self) -> list[dict[str, Any]] | None:
+        if not self.is_filesystem:
+            return None
+        schemas = deepcopy(list(_WEBSHOP_QWEN_TOOL_SCHEMAS))
+        if self.adapter_cls.allow_ask:
+            schemas.append(deepcopy(_WEBSHOP_QWEN_ASK_TOOL_SCHEMA))
+        return schemas
+
+    def normalize_initial_policy_context(
+        self,
+        messages: Sequence[Mapping[str, str]],
+    ) -> list[dict[str, str]]:
+        normalized = _copy_policy_messages(messages)
+        if not normalized or normalized[-1]["role"] != "user":
+            raise ValueError(
+                "AgentMemory initial policy context must end with an observation"
+            )
+        observation = str(self.observe())
+        if normalized[-1]["content"] != observation:
+            raise ValueError(
+                "AgentMemory initial policy context does not end with the current observation"
+            )
+        return self.policy_framing() + [
+            {"role": "user", "content": observation}
+        ]
+
+    def _reset_policy_transition_state(self, env_info: Mapping[str, Any]) -> None:
+        self._policy_step_count = 0
+        self._policy_turn_index = 0
+        self._policy_turn_budget: int | None = None
+        self._native_call_count = 0
+        self._context_epoch = 0
+        self._session_epoch = _optional_transition_int(
+            env_info.get("current_subtask_index")
+        ) or 0
+        self._immutable_policy_context: list[dict[str, str]] | None = None
+        self._current_policy_context: list[dict[str, str]] | None = None
+        self._policy_context_bound = False
+        self._pending_session_handoff: dict[str, Any] | None = None
+        self._pending_context_checkpoint: dict[str, Any] | None = None
+        self._checkpoint_write_retry_framing: list[dict[str, str]] | None = None
+        self._pending_checkpoint_read: dict[str, Any] | None = None
+        self._pending_checkpoint_read_framing: list[dict[str, str]] | None = None
+        self._pending_checkpoint_read_session: int | None = None
+        self._consumed_checkpoint_read: dict[str, Any] | None = None
+        self._selected_policy_control: str | None = None
+        self._successful_product_note_session: int | None = None
+
+    def bind_policy_context(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        initial: bool = False,
+    ) -> None:
+        normalized = _copy_policy_messages(messages)
+        if initial:
+            framing = list(normalized)
+            if (
+                framing
+                and framing[-1]["role"] == "user"
+                and framing[-1]["content"] == str(self.observe())
+            ):
+                framing.pop()
+            if not framing:
+                raise ValueError("AgentMemory policy framing must not be empty")
+            if framing != self.policy_framing():
+                raise ValueError(
+                    "AgentMemory initial policy framing differs from the formal prompt"
+                )
+            self._immutable_policy_context = framing
+            self._policy_context_bound = True
+        self._current_policy_context = normalized
+
+    def policy_turn_candidate(self) -> str | None:
+        if (
+            not self.is_filesystem
+            or not self._policy_context_bound
+            or self._pending_checkpoint_read is not None
+        ):
+            return None
+        if self._pending_session_handoff is not None:
+            return WEBSHOP_SESSION_HANDOFF_REQUEST
+        return WEBSHOP_CONTEXT_COMPACTION_REQUEST
+
+    def prepare_policy_turn(
+        self, pressure: PolicyContextPressure | None
+    ) -> str | None:
+        self._selected_policy_control = None
+        if not self.is_filesystem or not self._policy_context_bound:
+            return None
+        if self._pending_checkpoint_read is not None:
+            return None
+        if pressure is None:
+            raise RuntimeError(
+                "WebShop filesystem checkpoint requires task-neutral token pressure"
+            )
+        capacity = pressure.effective_prompt_capacity
+        if (
+            pressure.action_prompt_tokens > capacity
+            or pressure.candidate_prompt_tokens > capacity
+        ):
+            raise PolicyContextCapacityExceeded(
+                "WebShop context reached the prompt cap before a trainable "
+                "filesystem checkpoint could be sampled"
+            )
+
+        if self._pending_session_handoff is not None:
+            request = WEBSHOP_SESSION_HANDOFF_REQUEST
+            selected = "webshop_session_handoff"
+            checkpoint_due = True
+        else:
+            request = WEBSHOP_CONTEXT_COMPACTION_REQUEST
+            selected = "webshop_context_compaction"
+            checkpoint_due = self._pending_context_checkpoint is not None
+            if not checkpoint_due:
+                checkpoint_due = (
+                    checkpoint_retry_trigger_tokens(
+                        pressure, control_request=request
+                    )
+                    >= capacity
+                )
+                if checkpoint_due:
+                    self._pending_context_checkpoint = {
+                        "session_before": self._session_epoch,
+                        "session_after": self._session_epoch,
+                        "native_call_count": self._native_call_count,
+                    }
+        if not checkpoint_due:
+            return None
+        if checkpoint_retry_ceiling_tokens(
+            pressure,
+            control_request=request,
+        ) > capacity:
+
+
+            if selected == "webshop_session_handoff":
+                raise PolicyContextCapacityExceeded(
+                    "WebShop session handoff does not leave room for one bounded "
+                    "failed checkpoint attempt and retry"
+                )
+            raise PolicyContextCapacityExceeded(
+                "WebShop context checkpoint does not leave room for one bounded "
+                "failed write and retry"
+            )
+        if self._checkpoint_write_retry_framing is None:
+            if self._current_policy_context is None:
+                raise RuntimeError(
+                    "WebShop checkpoint request lost its pre-boundary context"
+                )
+            self._checkpoint_write_retry_framing = deepcopy(
+                self._current_policy_context
+            )
+        self._selected_policy_control = selected
+        return request
+
+    def __len__(self):
+        return self.data_len
+
+    def post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        data["id"] = self.env_id
+        response = requests.post(f"{self.env_server_base}/{path}", json=data, timeout=self.timeout)
+        if response.status_code != 200:
+            raise RuntimeError(
+                "AgentMemory env server rejected %s with HTTP %d: %s"
+                % (path, response.status_code, response.text[:500])
+            )
+        return response.json()
+
+    def get_metadata(self) -> dict[str, Any]:
+        response = requests.get(f"{self.env_server_base}/metadata", timeout=self.timeout)
+        if response.status_code != 200:
+            raise requests.RequestException(
+                f"Failed to fetch AgentMemoryGym metadata: {response}"
+            )
+        return response.json()
+
+    def observe(self) -> str:
+        observation = self.info["observation"]
+        if self.is_filesystem:
+            session_index = getattr(self, "_session_epoch", None)
+            note_written = bool(
+                isinstance(session_index, int)
+                and getattr(self, "_successful_product_note_session", None)
+                == session_index
+            )
+            env_info = self.info.get("env_info", {})
+            session_trace = (
+                env_info.get("session_trace")
+                if isinstance(env_info, Mapping)
+                else None
+            )
+            return normalize_filesystem_webshop_policy_observation(
+                observation,
+                session_index=session_index,
+                product_note_written=note_written,
+                session_trace=session_trace,
+            )
+        return observation
+
+    def step(self, action: str) -> StepOutput:
+
+
+        if not hasattr(self, "_policy_step_count"):
+            self._reset_policy_transition_state({})
+        if not hasattr(self, "is_filesystem"):
+            self.is_filesystem = False
+        if self._selected_policy_control in {
+            "webshop_session_handoff",
+            "webshop_context_compaction",
+        }:
+            return self._complete_filesystem_checkpoint(action)
+
+
+        return self._step_native_policy_action(action)
+
+    def _step_native_policy_action(self, action: str) -> StepOutput:
+        raw_policy_output = action
+        parser_evidence: dict[str, Any] = {}
+        parser_status = "server_native_v3"
+        if self.is_filesystem:
+            parsed_action, parser_evidence = (
+                normalize_filesystem_webshop_policy_action(
+                    action,
+                    allow_ask=self.adapter_cls.allow_ask,
+                )
+            )
+            parser_status = (
+                "qwen3_coder_normalized"
+                if parser_evidence["tool_parser_normalized"]
+                else "qwen3_coder_rejected"
+            )
+        else:
+            if action.endswith("</s>"):
+                action = action[:-4]
+            if self.is_v3:
+
+
+                parsed_action = action
+            else:
+                try:
+                    parsed_action = self.adapter_cls.action_parser(
+                        action,
+                        self.action_format,
+                    )
+                    parser_status = "adapter_parsed"
+                except Exception:
+
+                    parsed_action = action
+                    parser_status = "raw_fallback"
+                if not isinstance(parsed_action, str) or not parsed_action.strip():
+                    parsed_action = action
+                    parser_status = "raw_fallback"
+        native_before = self._native_call_count
+        policy_before = self._policy_step_count
+        context_before = self._context_epoch
+        session_before = self._session_epoch
+        checkpoint_read_pending_before = self._pending_checkpoint_read
+        checkpoint_read_framing_before = self._pending_checkpoint_read_framing
+        checkpoint_read_session_before = self._pending_checkpoint_read_session
+        boundary_pending_before = (
+            self._pending_session_handoff is not None
+            or self._pending_context_checkpoint is not None
+        )
+        consumed_checkpoint_read_before = self._consumed_checkpoint_read
+        browser_action = _parse_native_bracket_action(parsed_action)
+        response = self.post("step", {"action": parsed_action})
+        native_reward = float(response["reward"])
+        if not math.isfinite(native_reward):
+            raise RuntimeError(
+                "WebShop endpoint returned a non-finite reward"
+            )
+        response["reward"] = native_reward
+        self._native_call_count += 1
+        self._policy_step_count += 1
+        self.last_action_submission = {
+            "raw_policy_output": raw_policy_output,
+            "submitted_action": parsed_action,
+            "parser_status": parser_status,
+            **parser_evidence,
+        }
+        self.info = {
+            "observation": response["observation"],
+            "reward": response["reward"],
+            "done": response["done"],
+            "env_info": response.get("info", {}),
+            "metadata": self.metadata,
+        }
+        response_env_info = response.get("info", {})
+        if not isinstance(response_env_info, Mapping):
+            response_env_info = {}
+        else:
+            response_env_info = dict(response_env_info)
+        self.info["env_info"] = response_env_info
+        session_after = session_before
+        session_advanced = False
+        if self.is_filesystem:
+            session_after = _reported_webshop_session(
+                response_env_info, session_before
+            )
+            session_advanced = _validate_webshop_session_advance(
+                response_env_info,
+                before=session_before,
+                after=session_after,
+                done=bool(response["done"]),
+            )
+        self._session_epoch = session_after
+
+        context_transition = build_task_neutral_context_transition(
+            CONTEXT_OPERATION_APPEND
+        )
+        native_wrapper_evidence = {
+            "event": "native_action",
+            "checkpoint_boundary_pending": boundary_pending_before,
+            "session_advanced": session_advanced,
+            "native_call_count_before": native_before,
+            "native_call_count_after": self._native_call_count,
+            "policy_step_before": policy_before,
+            "policy_step_after": self._policy_step_count,
+            "context_epoch_before": context_before,
+            "context_epoch_after": self._context_epoch,
+            "session_epoch_before": session_before,
+            "session_epoch_after": self._session_epoch,
+        }
+        read_receipt = None
+        if self.is_filesystem:
+            latest_event = response_env_info.get("workspace_latest_event")
+            tool_ops = response_env_info.get("tool_ops")
+            event_is_current = _workspace_event_matches_current_action(
+                latest_event,
+                tool_ops,
+                native_step_after=self._native_call_count,
+                submitted_action=parsed_action,
+            )
+            if event_is_current:
+                action_kind = str(
+                    latest_event.get("tool_name", latest_event.get("op", ""))
+                ).lower()
+                action_completed = filesystem_checkpoint_action_completed(
+                    action_kind,
+                    latest_event,
+                )
+                checkpoint_receipt = build_filesystem_checkpoint_receipt(
+                    action_kind=action_kind,
+                    action_completed=action_completed,
+                    submitted_action=parsed_action,
+                    workspace_diff=latest_event.get("workspace_diff"),
+                    workspace_snapshot=response_env_info.get("workspace_snapshot"),
+                )
+                native_wrapper_evidence[
+                    "filesystem_checkpoint"
+                ] = checkpoint_receipt
+                response_env_info["action_kind"] = action_kind
+                response_env_info["filesystem_checkpoint"] = checkpoint_receipt
+                read_receipt = build_filesystem_checkpoint_read_receipt(
+                    checkpoint_receipt,
+                    action_kind=action_kind,
+                    action_completed=action_completed,
+                    stdout=latest_event.get("stdout"),
+                )
+                native_wrapper_evidence[
+                    "filesystem_checkpoint_read"
+                ] = read_receipt
+                response_env_info["filesystem_checkpoint_read"] = read_receipt
+                if filesystem_checkpoint_read_observed(read_receipt):
+                    native_wrapper_evidence.update(
+                        {
+                            "memory_event": "read",
+                            "document_read_observed": True,
+                        }
+                    )
+                workspace_diff = latest_event.get("workspace_diff")
+                added_entries = (
+                    workspace_diff.get("added", ())
+                    if isinstance(workspace_diff, Mapping)
+                    else ()
+                )
+                modified_entries = (
+                    workspace_diff.get("modified", ())
+                    if isinstance(workspace_diff, Mapping)
+                    else ()
+                )
+
+
+                product_note_touched = any(
+                    isinstance(item, Mapping)
+                    and item.get("kind") == "file"
+                    and item.get("path") != FILESYSTEM_CHECKPOINT_PATH
+                    for item in added_entries
+                ) or any(
+                    isinstance(item, Mapping)
+                    and isinstance(item.get("after"), Mapping)
+                    and item["after"].get("kind") == "file"
+                    and item["after"].get("path") != FILESYSTEM_CHECKPOINT_PATH
+                    for item in modified_entries
+                )
+                if action_completed and product_note_touched:
+                    self._successful_product_note_session = session_before
+                    native_wrapper_evidence["webshop_product_note_recorded"] = True
+        checkpoint_read_satisfied = False
+        checkpoint_read_already_consumed = False
+        read_failure_reason = None
+        if (
+            checkpoint_read_pending_before is None
+            and consumed_checkpoint_read_before is not None
+            and consumed_checkpoint_read_before.get("session_index") == session_before
+            and session_after == session_before
+            and filesystem_checkpoint_read_matches(
+                read_receipt,
+                consumed_checkpoint_read_before.get("checkpoint_receipt"),
+            )
+        ):
+            checkpoint_read_already_consumed = True
+            native_wrapper_evidence.update(
+                {
+                    "checkpoint_read_already_consumed": True,
+                    "checkpoint_read_consumed_session_index": session_before,
+                }
+            )
+        if checkpoint_read_pending_before is not None:
+            read_failure_reason = filesystem_checkpoint_read_failure_reason(
+                read_receipt,
+                checkpoint_read_pending_before,
+            )
+            checkpoint_read_satisfied = read_failure_reason is None
+            native_wrapper_evidence.update(
+                {
+                    "checkpoint_read_required": True,
+                    "checkpoint_read_satisfied": checkpoint_read_satisfied,
+                    "checkpoint_read_retry_pending": bool(
+                        not checkpoint_read_satisfied and not bool(response["done"])
+                    ),
+                    "checkpoint_read_failure_reason": read_failure_reason,
+                    "checkpoint_read_expected_size_bytes": (
+                        checkpoint_read_pending_before.get("size_bytes")
+                    ),
+                    "checkpoint_read_expected_sha256": (
+                        checkpoint_read_pending_before.get("sha256")
+                    ),
+                }
+            )
+            if checkpoint_read_satisfied or bool(response["done"]):
+                self._pending_checkpoint_read = None
+                self._pending_checkpoint_read_framing = None
+                self._pending_checkpoint_read_session = None
+
+        if checkpoint_read_satisfied and not bool(response["done"]):
+            if (
+                checkpoint_read_framing_before is None
+                or not checkpoint_read_framing_before
+                or checkpoint_read_framing_before[-1].get("role") != "user"
+            ):
+                raise RuntimeError(
+                    "WebShop successful checkpoint read lost its fresh browser state"
+                )
+            if (
+                checkpoint_read_session_before is not None
+                and checkpoint_read_session_before != self._session_epoch
+            ):
+
+
+                native_wrapper_evidence["checkpoint_read_session_drifted"] = True
+                policy_observation = (
+                    "Current-step browser state: the shopping session advanced "
+                    "while the checkpoint read was pending, so the page captured "
+                    "before the read is stale; re-orient from the task statement "
+                    "and the recovered workspace notes.\n\n"
+                    "Recovered checkpoint contents:\n"
+                    f"{response['observation']}\n\n"
+                    f"{WEBSHOP_POST_CHECKPOINT_READ_MARKER}"
+                )
+            else:
+                recovered_observation = _dedupe_webshop_workspace_contract(
+                    checkpoint_read_framing_before[-1]["content"],
+                    response["observation"],
+                )
+                policy_observation = (
+                    f"{checkpoint_read_framing_before[-1]['content']}\n\n"
+                    "Recovered checkpoint contents:\n"
+                    f"{recovered_observation}\n\n"
+                    f"{WEBSHOP_POST_CHECKPOINT_READ_MARKER}"
+                )
+                self._consumed_checkpoint_read = {
+                    "session_index": session_before,
+                    "checkpoint_receipt": dict(checkpoint_read_pending_before),
+                    "framing": deepcopy(checkpoint_read_framing_before),
+                }
+                native_wrapper_evidence["checkpoint_read_consumed"] = True
+        elif checkpoint_read_already_consumed and not bool(response["done"]):
+            consumed_framing = consumed_checkpoint_read_before.get("framing")
+            if (
+                not isinstance(consumed_framing, list)
+                or not consumed_framing
+                or consumed_framing[-1].get("role") != "user"
+            ):
+                raise RuntimeError(
+                    "WebShop consumed checkpoint read lost its fresh browser state"
+                )
+            recovered_observation = _dedupe_webshop_workspace_contract(
+                consumed_framing[-1]["content"],
+                response["observation"],
+            )
+            policy_observation = (
+                f"{consumed_framing[-1]['content']}\n\n"
+                "Recovered checkpoint contents:\n"
+                f"{recovered_observation}\n\n"
+                f"{WEBSHOP_REPEATED_CHECKPOINT_READ_MARKER}"
+            )
+        elif (
+            checkpoint_read_pending_before is not None
+            and not checkpoint_read_satisfied
+            and not bool(response["done"])
+        ):
+            policy_observation = build_filesystem_checkpoint_read_retry_observation(
+                read_failure_reason or "checkpoint_read_not_observed"
+            )
+        else:
+            policy_observation = response["observation"]
+        if self.is_filesystem:
+            if session_advanced:
+                self._successful_product_note_session = None
+            note_written = self._successful_product_note_session == self._session_epoch
+            policy_observation = normalize_filesystem_webshop_policy_observation(
+                str(policy_observation),
+                session_index=self._session_epoch,
+                product_note_written=note_written,
+                session_trace=response_env_info.get("session_trace"),
+            )
+            native_wrapper_evidence["webshop_product_note_written"] = note_written
+        if (
+            bool(response["done"])
+            or session_advanced
+            or browser_action is not None
+        ):
+            self._consumed_checkpoint_read = None
+        if self.is_filesystem and session_advanced:
+            self._pending_session_handoff = {
+                "fresh_observation": normalize_filesystem_webshop_policy_observation(
+                    str(response["observation"]),
+                    session_index=self._session_epoch,
+                    product_note_written=False,
+                ),
+                "session_before": session_before,
+                "session_after": session_after,
+                "native_call_count": self._native_call_count,
+            }
+        if self._policy_context_bound and not bool(response["done"]):
+            if self._selected_policy_control in {
+                "webshop_session_handoff",
+                "webshop_context_compaction",
+            }:
+
+
+                context_transition = build_task_neutral_context_transition(
+                    CONTEXT_OPERATION_PRESERVE
+                )
+            elif (
+                checkpoint_read_pending_before is not None
+                and not checkpoint_read_satisfied
+            ):
+                if checkpoint_read_framing_before is None:
+                    raise RuntimeError(
+                        "WebShop pending checkpoint read lost its trusted framing"
+                    )
+                context_transition = build_task_neutral_context_transition(
+                    CONTEXT_OPERATION_REPLACE,
+                    messages=build_post_checkpoint_read_retry_context(
+
+
+                        _strip_webshop_rounds_footer(checkpoint_read_framing_before),
+                        checkpoint_read_pending_before,
+                        read_failure_reason or "checkpoint_read_not_observed",
+                        continuation_marker=self._webshop_continuation_marker(),
+                    ),
+                )
+            elif self.is_filesystem and session_advanced:
+                context_transition = build_task_neutral_context_transition(
+                    CONTEXT_OPERATION_PRESERVE
+                )
+            else:
+
+
+                policy_observation += self._webshop_rounds_footer()
+                context_transition = build_task_neutral_context_transition(
+                    CONTEXT_OPERATION_APPEND
+                )
+        return StepOutput(
+            state=policy_observation,
+            reward=response["reward"],
+            done=response["done"],
+            info=build_task_neutral_transition_info(
+                env_info=response_env_info,
+                action_submission=self.last_action_submission,
+                native_step_before=native_before,
+                native_step_after=self._native_call_count,
+                native_call_count_before=native_before,
+                native_call_count_after=self._native_call_count,
+                context_epoch_before=context_before,
+                context_epoch_after=self._context_epoch,
+                session_epoch_before=session_before,
+                session_epoch_after=self._session_epoch,
+                policy_step_before=policy_before,
+                policy_step_after=self._policy_step_count,
+                context_transition=context_transition,
+                wrapper_evidence={
+                    **native_wrapper_evidence,
+
+
+                    "message_list_rebased": (
+                        context_transition["operation"]
+                        == CONTEXT_OPERATION_REPLACE
+                    ),
+                },
+            ),
+        )
+
+    def _complete_filesystem_checkpoint(self, action: str) -> StepOutput:
+        selected = self._selected_policy_control
+        if selected == "webshop_session_handoff":
+            pending = self._pending_session_handoff
+            event = "webshop_session_handoff"
+        elif selected == "webshop_context_compaction":
+            pending = self._pending_context_checkpoint
+            event = "webshop_context_compaction"
+        else:
+            pending = None
+            event = "webshop_filesystem_checkpoint"
+        write_retry_framing_before = self._checkpoint_write_retry_framing
+        if pending is None:
+            raise RuntimeError("WebShop checkpoint was selected without a boundary")
+        if self._immutable_policy_context is None:
+            raise RuntimeError("WebShop checkpoint lost its immutable framing")
+
+        native_output = self._step_native_policy_action(action)
+        self._selected_policy_control = None
+        info = dict(native_output.info)
+        env_info = info.get("env_info", {})
+        latest_event = (
+            env_info.get("workspace_latest_event")
+            if isinstance(env_info, Mapping)
+            else None
+        )
+        tool_ops = env_info.get("tool_ops") if isinstance(env_info, Mapping) else None
+        checkpoint_receipt = None
+        if _workspace_event_matches_current_action(
+            latest_event,
+            tool_ops,
+            native_step_after=info.get("native_step_after"),
+            submitted_action=(
+                info.get("action_submission", {}).get("submitted_action")
+                if isinstance(info.get("action_submission"), Mapping)
+                else None
+            ),
+        ):
+            action_kind = str(
+                latest_event.get("tool_name", latest_event.get("op", ""))
+            ).lower()
+            checkpoint_receipt = build_filesystem_checkpoint_receipt(
+                action_kind=action_kind,
+                action_completed=filesystem_checkpoint_action_completed(
+                    action_kind,
+                    latest_event,
+                ),
+                submitted_action=(
+                    info.get("action_submission", {}).get("submitted_action")
+                    if isinstance(info.get("action_submission"), Mapping)
+                    else None
+                ),
+                workspace_diff=latest_event.get("workspace_diff"),
+                workspace_snapshot=env_info.get("workspace_snapshot"),
+            )
+        persisted = filesystem_checkpoint_write_succeeded(checkpoint_receipt)
+        multi_tool_action = checkpoint_action_has_multiple_tool_ops(tool_ops)
+        if multi_tool_action:
+            persisted = False
+        session_stable = self._session_epoch == int(pending["session_after"])
+        if selected == "webshop_context_compaction" and not session_stable:
+
+
+            self._pending_context_checkpoint = None
+        checkpoint_failure_reason = (
+            filesystem_checkpoint_failure_reason(checkpoint_receipt)
+            if session_stable
+            else "unexpected_session_advance"
+        )
+        if multi_tool_action and session_stable:
+            checkpoint_failure_reason = "checkpoint_multi_tool_action"
+        replace_context = bool(persisted and session_stable and not native_output.done)
+        server_trace_commit = None
+        fresh_observation = pending.get("fresh_observation")
+        if replace_context and selected == "webshop_context_compaction":
+            server_trace_commit = self.post(
+                "filesystem-checkpoint-commit",
+                {
+                    "session_index": self._session_epoch,
+                    "step_count": self._native_call_count,
+                    "size_bytes": checkpoint_receipt["size_bytes"],
+                    "sha256": checkpoint_receipt["sha256"],
+                },
+            )
+            commit_info = server_trace_commit.get("info", {})
+            commit_receipt = commit_info.get(
+                "filesystem_checkpoint_trace_commit"
+            )
+            expected_commit = {
+                "schema": "agentmemory_webshop_trace_checkpoint_commit_v1",
+                "session_index": self._session_epoch,
+                "step_count": self._native_call_count,
+                "size_bytes": checkpoint_receipt["size_bytes"],
+                "sha256": checkpoint_receipt["sha256"],
+            }
+            if (
+                not isinstance(commit_receipt, Mapping)
+                or any(
+                    commit_receipt.get(key) != value
+                    for key, value in expected_commit.items()
+                )
+                or commit_info.get("session_trace") != []
+                or bool(server_trace_commit.get("done"))
+                or not isinstance(server_trace_commit.get("observation"), str)
+            ):
+                raise RuntimeError(
+                    "WebShop server did not attest the exact context checkpoint commit"
+                )
+            fresh_observation = normalize_filesystem_webshop_policy_observation(
+                str(server_trace_commit["observation"]),
+                session_index=self._session_epoch,
+                product_note_written=(
+                    self._successful_product_note_session == self._session_epoch
+                ),
+                session_trace=commit_info.get("session_trace"),
+            )
+        retry_pending = bool(
+            (
+                self._pending_session_handoff is not None
+                or self._pending_context_checkpoint is not None
+            )
+            and not replace_context
+            and not native_output.done
+        )
+        policy_observation = (
+            build_filesystem_checkpoint_retry_observation(
+                checkpoint_failure_reason or "unknown_checkpoint_failure"
+            )
+            if retry_pending
+            else native_output.state
+        )
+
+        context_transition = None
+        checkpoint_framing_sha256 = None
+        if replace_context:
+            if not isinstance(fresh_observation, str):
+                raise RuntimeError("WebShop checkpoint has no fresh successor observation")
+            framing = self._fresh_policy_context(fresh_observation)
+            checkpoint_framing_sha256 = filesystem_checkpoint_framing_sha256(
+                framing
+            )
+            replacement = build_post_checkpoint_context(
+                framing,
+                checkpoint_receipt,
+                continuation_marker=WEBSHOP_POLICY_CONTINUATION_MARKER,
+            )
+            self._context_epoch += 1
+            if selected == "webshop_session_handoff":
+                self._pending_session_handoff = None
+            else:
+                self._pending_context_checkpoint = None
+            self._pending_checkpoint_read = dict(checkpoint_receipt)
+            self._pending_checkpoint_read_framing = deepcopy(framing)
+            self._pending_checkpoint_read_session = int(self._session_epoch)
+            self._consumed_checkpoint_read = None
+            self._checkpoint_write_retry_framing = None
+            context_transition = build_task_neutral_context_transition(
+                CONTEXT_OPERATION_REPLACE,
+                messages=replacement,
+            )
+        elif native_output.done:
+            self._pending_session_handoff = None
+            self._pending_context_checkpoint = None
+            self._checkpoint_write_retry_framing = None
+            self._pending_checkpoint_read = None
+            self._pending_checkpoint_read_framing = None
+            self._pending_checkpoint_read_session = None
+            self._consumed_checkpoint_read = None
+        elif retry_pending:
+            if write_retry_framing_before is None:
+                raise RuntimeError(
+                    "WebShop failed checkpoint write lost its retry context"
+                )
+            context_transition = build_task_neutral_context_transition(
+                CONTEXT_OPERATION_REPLACE,
+                messages=build_filesystem_checkpoint_write_retry_context(
+
+
+                    _strip_webshop_rounds_footer(write_retry_framing_before),
+                    checkpoint_failure_reason or "unknown_checkpoint_failure",
+                    continuation_marker=self._webshop_continuation_marker(),
+                ),
+            )
+
+        return StepOutput(
+            state=policy_observation,
+            reward=native_output.reward,
+            done=native_output.done,
+            info=build_task_neutral_transition_info(
+                env_info=env_info if isinstance(env_info, Mapping) else {},
+                action_submission=info.get(
+                    "action_submission", {"raw_policy_output": action}
+                ),
+                native_step_before=info.get("native_step_before"),
+                native_step_after=info.get("native_step_after"),
+                native_call_count_before=info.get("native_call_count_before"),
+                native_call_count_after=info.get("native_call_count_after"),
+                context_epoch_before=info.get("context_epoch_before"),
+                context_epoch_after=self._context_epoch,
+                session_epoch_before=info.get("session_epoch_before"),
+                session_epoch_after=info.get("session_epoch_after"),
+                policy_step_before=info.get("policy_step_before"),
+                policy_step_after=info.get("policy_step_after"),
+                context_transition=context_transition,
+                wrapper_evidence={
+                    "event": event,
+                    "session_before": pending["session_before"],
+                    "session_after": pending["session_after"],
+                    "native_call_count_before": info.get(
+                        "native_call_count_before"
+                    ),
+                    "native_call_count_after": info.get("native_call_count_after"),
+                    "policy_step_before": info.get("policy_step_before"),
+                    "policy_step_after": info.get("policy_step_after"),
+                    "context_epoch_before": info.get("context_epoch_before"),
+                    "context_epoch_after": self._context_epoch,
+                    "session_epoch_before": info.get("session_epoch_before"),
+                    "session_epoch_after": info.get("session_epoch_after"),
+                    "continuation_path": FILESYSTEM_CHECKPOINT_PATH,
+                    "continuation_max_bytes": FILESYSTEM_CHECKPOINT_MAX_BYTES,
+                    "continuation_persisted": persisted,
+                    "checkpoint_receipt": checkpoint_receipt,
+                    "checkpoint_failure_reason": checkpoint_failure_reason,
+                    "context_replaced": replace_context,
+                    "retry_pending": retry_pending,
+                    "checkpoint_retry_observation_bounded": retry_pending,
+                    "checkpoint_retry_context_rebuilt": retry_pending,
+
+
+                    "message_list_rebased": replace_context,
+                    "preserved_policy_output": replace_context,
+                    "preserved_native_observation": replace_context,
+                    "checkpoint_action_in_successor_context": False,
+                    "checkpoint_observation_in_successor_context": False,
+                    "checkpoint_content_in_successor_context": False,
+                    "checkpoint_framing_sha256": checkpoint_framing_sha256,
+                    "checkpoint_read_required_after": replace_context,
+                    "server_session_trace_cleared": bool(server_trace_commit),
+                    "server_trace_commit": (
+                        None
+                        if not isinstance(server_trace_commit, Mapping)
+                        else server_trace_commit.get("info", {}).get(
+                            "filesystem_checkpoint_trace_commit"
+                        )
+                    ),
+                    "native_wrapper_evidence": (
+                        dict(info.get("wrapper_evidence", {}))
+                        if isinstance(info.get("wrapper_evidence"), Mapping)
+                        else {}
+                    ),
+                },
+            ),
+        )
+
+    def _fresh_policy_context(self, observation: str) -> list[dict[str, str]]:
+
+
+        framing = self._immutable_policy_context
+        if framing is None:
+            raise RuntimeError("AgentMemory policy context was not initialized")
+        content = str(observation)
+
+
+        content += self._webshop_rounds_footer()
+        messages = deepcopy(framing)
+        messages.append({"role": "user", "content": content})
+        return messages
+
+    def _webshop_rounds_footer(self) -> str:
+
+
+        if self._policy_turn_budget is not None:
+            used = self._webshop_rounds_used()
+            remaining = max(0, self._policy_turn_budget - used)
+            if remaining <= 1:
+
+
+                return "\n\n" + _WEBSHOP_FINAL_TURN_NOTICE
+            return (
+                f"\n\n[Shop round budget: round {used} of "
+                f"{self._policy_turn_budget}; {remaining} rounds remain.]"
+            )
+        if getattr(self, "_policy_step_count", 0) > 0:
+            return f"\n\n[Shop policy rounds used: {self._policy_step_count}.]"
+        return ""
+
+    def begin_policy_turn(self, turn_index: int, turn_budget: int) -> None:
+
+
+        self._policy_turn_index = int(turn_index)
+        self._policy_turn_budget = int(turn_budget)
+
+    def _webshop_rounds_used(self) -> int:
+
+
+        if self._policy_turn_budget is not None:
+            return self._policy_turn_index + 1
+        return self._policy_step_count
+
+    def _webshop_continuation_marker(self) -> str:
+
+        marker = WEBSHOP_POLICY_CONTINUATION_MARKER
+        if self._policy_turn_budget is not None:
+            used = self._webshop_rounds_used()
+            remaining = max(0, self._policy_turn_budget - used)
+            if remaining <= 1:
+
+
+                return f"{marker} {_WEBSHOP_FINAL_TURN_NOTICE}"
+            marker = (
+                f"{marker} [Shop round budget: round {used} of "
+                f"{self._policy_turn_budget}; {remaining} rounds remain.]"
+            )
+        elif getattr(self, "_policy_step_count", 0) > 0:
+            marker = (
+                f"{marker} [Shop policy rounds used: "
+                f"{self._policy_step_count}.]"
+            )
+        return marker
+
+    @property
+    def sample_excluded(self) -> bool:
+        return bool(self.info.get("env_info", {}).get("sample_excluded", False))
+
+    def reset(self, idx: int = 0) -> dict[str, Any]:
+        response = self.post("reset", {"data_idx": idx})
+        self.last_action_submission = None
+        self.info = {
+            "observation": response["observation"],
+            "reward": response["reward"],
+            "done": response["done"],
+            "env_info": response.get("info", {}),
+            "metadata": self.metadata,
+        }
+        response_env_info = response.get("info", {})
+        if not isinstance(response_env_info, Mapping):
+            response_env_info = {}
+        self._reset_policy_transition_state(response_env_info)
+        return response
+
+    def close(self):
+        return self.post("close", {})
+
+    def finalize_policy_horizon(self) -> StepOutput:
+
+        last_env_info: dict[str, Any] = {}
+        if isinstance(self.info.get("env_info"), Mapping):
+            last_env_info = dict(self.info["env_info"])
+        env_info = {
+            **last_env_info,
+            "status": "max_policy_steps_exhausted",
+            "episode_success": False,
+            "sample_excluded": False,
+            "reward_components": [
+                {
+                    "name": "max_round_timeout_failure",
+                    "value": WEBSHOP_MAX_ROUND_TIMEOUT_FAILURE,
+                    "step": self._policy_step_count,
+                    "max_rounds": self._policy_step_count,
+                }
+            ],
+        }
+        return StepOutput(
+            state=(
+                "WebShop policy-turn budget exhausted without a "
+                "completed purchase."
+            ),
+            reward=WEBSHOP_MAX_ROUND_TIMEOUT_FAILURE,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info=env_info,
+                action_submission={"control_action": "horizon"},
+                native_step_before=self._native_call_count,
+                native_step_after=self._native_call_count,
+                native_call_count_before=self._native_call_count,
+                native_call_count_after=self._native_call_count,
+                context_epoch_before=self._context_epoch,
+                context_epoch_after=self._context_epoch,
+                session_epoch_before=self._session_epoch,
+                session_epoch_after=self._session_epoch,
+                policy_step_before=self._policy_step_count,
+                policy_step_after=self._policy_step_count,
+                wrapper_evidence={
+                    "event": "horizon_finalization",
+                    "outcome": "max_rounds",
+                },
+            ),
+        )
+
+
+def format_action(action_name: str, arguments: dict[str, Any]) -> str:
+    if action_name == "search":
+        return _format_native_bracket_action(action_name, arguments, "keywords")
+    if action_name == "click":
+        return _format_native_bracket_action(action_name, arguments, "item")
+    if action_name not in JSON_ACTION_NAMES:
+        raise ValueError(f"Unsupported AgentMemoryGym action: {action_name}")
+    return f"{action_name} {json.dumps(arguments, ensure_ascii=False)}"
+
+
+def extract_bare_env_action(text: str) -> str:
+
+    cleaned = strip_think_prefix(text).strip()
+    if cleaned.endswith("</s>"):
+        cleaned = cleaned[:-4].strip()
+
+
+    try:
+        action_name, arguments = parse_env_action(cleaned)
+        return format_action(action_name, arguments)
+    except Exception:
+        return ""
+
+
+def parse_env_action(action: str) -> tuple[str, dict[str, Any]]:
+    cleaned = action.strip()
+    native_action = _parse_native_bracket_action(cleaned)
+    if native_action is not None:
+        action_name, argument = native_action
+        if argument:
+            key = "keywords" if action_name == "search" else "item"
+            return action_name, {key: argument}
+    json_match = JSON_ACTION_RE.fullmatch(cleaned)
+    if json_match is None:
+        raise ValueError(
+            "Expected one native bracket action or uppercase JSON tool action."
+        )
+    payload = json.loads(json_match.group(2))
+    if not isinstance(payload, dict):
+        raise ValueError("JSON tool payload must be a JSON object.")
+    return json_match.group(1), payload
+
+
+def build_code_action_functions() -> dict[str, Any]:
+    def make_function(action_name: str):
+        def code_action(**kwargs):
+            return format_action(action_name, kwargs)
+
+        return code_action
+
+    return {function_name: make_function(action_name) for function_name, action_name in FUNCTION_TO_ACTION.items()}
+
+
+def _require_function_text(arguments: dict[str, Any], key: str) -> str:
+    if set(arguments) != {key}:
+        raise ValueError(f"Expected exactly one function argument: {key}")
+    value = arguments[key]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Function argument {key} must be a non-empty string.")
+    if any(char in value for char in "\r\n"):
+        raise ValueError(f"Function argument {key} contains a newline.")
+    return value.strip()
+
+
+def _format_native_bracket_action(
+    action_name: str,
+    arguments: dict[str, Any],
+    key: str,
+) -> str:
+    value = _require_function_text(arguments, key)
+    formatted = f"{action_name}[{value}]"
+
+
+    if _parse_native_bracket_action(formatted) != (action_name, value):
+        raise ValueError(
+            f"Function argument {key} cannot be represented as one native "
+            "balanced-bracket action."
+        )
+    return formatted

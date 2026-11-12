@@ -1,0 +1,11 @@
+{
+  "algorithm": "sha256_path_type_mode_uid_gid_nlink_size_content_v1",
+  "bytes": 30495880931,
+  "python_path": "/opt/miniconda3/envs/testbed/bin/python3.10",
+  "python_sha256": "b6219e06a3c9ca38496786e4c61ccdc174eac6ab34d057ef70ecfee30b4ce5fc",
+  "regular_files": 210770,
+  "runtime_digest": "sha256:ada19e0d27dadb991c5b6112e00f116b26359067d5298650eb2eeff7d8385af2",
+  "schema": "openmle_fast_rootfs_tree_lock_v2",
+  "status": "verified_authorized_pod",
+  "tree_sha256": "6838b228578de37939c91262da788138703d79b6feda8282a5c37f7feb118ec1"
+}

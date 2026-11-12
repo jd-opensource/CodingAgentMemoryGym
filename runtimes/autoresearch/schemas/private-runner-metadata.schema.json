@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_private_runner_metadata_v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "contract", "runtime_digest", "formal_eligible",
+    "formal_ineligibility", "kernel_release", "cgroup_version", "cgroup_mode",
+    "cgroup_controller_attestation", "cgroup_v1_cpu", "cgroup_v1_memory",
+    "cgroup_v1_pids", "cgroup_v2_cpu", "cgroup_v2_memory", "cgroup_v2_pids",
+    "fresh_worker_per_grade", "selected_task_only_mounts", "staged_task_files",
+    "submission_passed_by_fd", "all_task_inputs_passed_by_fd", "result_sanitized_ipc",
+    "service_environment_hidden", "network_namespace", "network_no_egress",
+    "dns_disabled", "metadata_service_blocked", "external_unix_sockets_blocked",
+    "pid_namespace", "ipc_namespace", "mount_namespace", "fresh_unprivileged_uid_gid",
+    "capabilities_dropped", "no_new_privs", "seccomp", "read_only_rootfs",
+    "isolated_proc", "minimal_devices", "gpu_devices_absent", "core_dumps_disabled",
+    "hard_wall_supervision", "runner_completion_grace_ms", "descendant_kill_reap",
+    "parent_death_cleanup_watchdog", "worker_teardown_verified",
+    "validate_submission_once", "evaluate_once_after_validation", "worker_result_schema",
+    "worker_source_sha256", "active_verification", "artifact_identity", "resource_limits"
+  ],
+  "properties": {
+    "schema": {"const": "openmle_fast_private_runner_metadata_v2"},
+    "contract": {"const": "openmle_fast_private_grader_runner_v1"},
+    "runtime_digest": {"$ref": "#/$defs/runtimeDigest"},
+    "formal_eligible": {"type": "boolean"},
+    "formal_ineligibility": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "kernel_release": {"type": "string", "minLength": 1},
+    "cgroup_version": {"$ref": "#/$defs/cgroupVersion"},
+    "cgroup_mode": {"$ref": "#/$defs/cgroupVersion"},
+    "cgroup_controller_attestation": {"$ref": "#/$defs/controllerAttestation"},
+    "cgroup_v1_cpu": {"type": "boolean"}, "cgroup_v1_memory": {"type": "boolean"},
+    "cgroup_v1_pids": {"type": "boolean"}, "cgroup_v2_cpu": {"type": "boolean"},
+    "cgroup_v2_memory": {"type": "boolean"}, "cgroup_v2_pids": {"type": "boolean"},
+    "fresh_worker_per_grade": {"type": "boolean"},
+    "selected_task_only_mounts": {"type": "boolean"},
+    "staged_task_files": {"const": ["metric.py", "answer.csv", "submission.csv"]},
+    "submission_passed_by_fd": {"type": "boolean"},
+    "all_task_inputs_passed_by_fd": {"type": "boolean"},
+    "result_sanitized_ipc": {"type": "boolean"},
+    "service_environment_hidden": {"type": "boolean"},
+    "network_namespace": {"type": "boolean"}, "network_no_egress": {"type": "boolean"},
+    "dns_disabled": {"type": "boolean"}, "metadata_service_blocked": {"type": "boolean"},
+    "external_unix_sockets_blocked": {"type": "boolean"}, "pid_namespace": {"type": "boolean"},
+    "ipc_namespace": {"type": "boolean"}, "mount_namespace": {"type": "boolean"},
+    "fresh_unprivileged_uid_gid": {"type": "boolean"}, "capabilities_dropped": {"type": "boolean"},
+    "no_new_privs": {"type": "boolean"}, "seccomp": {"type": "boolean"},
+    "read_only_rootfs": {"type": "boolean"}, "isolated_proc": {"type": "boolean"},
+    "minimal_devices": {"type": "boolean"}, "gpu_devices_absent": {"type": "boolean"},
+    "core_dumps_disabled": {"type": "boolean"}, "hard_wall_supervision": {"type": "boolean"},
+    "runner_completion_grace_ms": {"const": 750}, "descendant_kill_reap": {"type": "boolean"},
+    "parent_death_cleanup_watchdog": {"type": "boolean"}, "worker_teardown_verified": {"type": "boolean"},
+    "validate_submission_once": {"type": "boolean"}, "evaluate_once_after_validation": {"type": "boolean"},
+    "worker_result_schema": {"const": "openmle_fast_private_worker_result_v1"},
+    "worker_source_sha256": {"$ref": "#/$defs/nullableSha256"},
+    "active_verification": {"$ref": "#/$defs/activeVerification"},
+    "artifact_identity": {"$ref": "#/$defs/artifactIdentity"},
+    "resource_limits": {"$ref": "#/$defs/privateLimits"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableSha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "runtimeDigest": {"const": "sha256:ada19e0d27dadb991c5b6112e00f116b26359067d5298650eb2eeff7d8385af2"},
+    "cgroupVersion": {"enum": ["v1", "hybrid", "v2", "unknown"]},
+    "controllerAttestation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "version", "controllers", "no_swap_contract"],
+      "properties": {
+        "schema": {"const": "openmle_fast_cgroup_controller_attestation_v1"},
+        "version": {"$ref": "#/$defs/cgroupVersion"},
+        "controllers": {
+          "type": "object", "additionalProperties": false,
+          "required": ["cpu", "memory", "pids"],
+          "properties": {
+            "cpu": {"$ref": "#/$defs/cpuController"},
+            "memory": {"$ref": "#/$defs/memoryController"},
+            "pids": {"$ref": "#/$defs/pidsController"}
+          }
+        },
+        "no_swap_contract": {"const": "memory_limit_equals_memsw_limit_and_swappiness_zero"}
+      }
+    },
+    "cpuController": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hierarchy", "required_files", "available"],
+      "properties": {"hierarchy": {"const": "cpu,cpuacct"}, "required_files": {"const": ["cpu.cfs_period_us", "cpu.cfs_quota_us", "tasks"]}, "available": {"type": "boolean"}}
+    },
+    "memoryController": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hierarchy", "required_files", "available"],
+      "properties": {"hierarchy": {"const": "memory"}, "required_files": {"const": ["memory.limit_in_bytes", "memory.memsw.limit_in_bytes", "memory.swappiness", "tasks"]}, "available": {"type": "boolean"}}
+    },
+    "pidsController": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hierarchy", "required_files", "available"],
+      "properties": {"hierarchy": {"const": "pids"}, "required_files": {"const": ["pids.max", "tasks"]}, "available": {"type": "boolean"}}
+    },
+    "rootfsIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "path", "runtime_digest", "tree_lock_sha256", "tree_lock", "tree_measurement", "root_stat", "sidecar_sha256", "critical_file_sha256", "metadata_contract", "valid"],
+      "properties": {
+        "schema": {"const": "openmle_fast_rootfs_identity_v2"}, "path": {"type": "string", "minLength": 1},
+        "runtime_digest": {"$ref": "#/$defs/runtimeDigest"},
+        "tree_lock_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "tree_lock": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["schema", "runtime_digest", "algorithm", "tree_sha256", "python_path", "python_sha256", "regular_files", "bytes", "status"],
+          "properties": {"schema": {"const": "openmle_fast_rootfs_tree_lock_v2"}, "runtime_digest": {"$ref": "#/$defs/runtimeDigest"}, "algorithm": {"const": "sha256_path_type_mode_uid_gid_nlink_size_content_v1"}, "tree_sha256": {"$ref": "#/$defs/nullableSha256"}, "python_path": {"const": "/opt/miniconda3/envs/testbed/bin/python3.10"}, "python_sha256": {"$ref": "#/$defs/nullableSha256"}, "regular_files": {"type": "integer", "minimum": 0}, "bytes": {"type": "integer", "minimum": 0}, "status": {"type": "string", "minLength": 1}}
+        },
+        "tree_measurement": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["schema", "algorithm", "tree_sha256", "python_path", "python_sha256", "regular_files", "bytes"],
+          "properties": {"schema": {"const": "openmle_fast_rootfs_tree_measurement_v1"}, "algorithm": {"const": "sha256_path_type_mode_uid_gid_nlink_size_content_v1"}, "tree_sha256": {"$ref": "#/$defs/sha256"}, "python_path": {"const": "/opt/miniconda3/envs/testbed/bin/python3.10"}, "python_sha256": {"$ref": "#/$defs/sha256"}, "regular_files": {"type": "integer", "minimum": 1}, "bytes": {"type": "integer", "minimum": 1}}
+        },
+        "root_stat": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["device", "inode", "mode", "uid", "gid", "mtime_ns", "ctime_ns"],
+          "properties": {"device": {"type": "integer", "minimum": 0}, "inode": {"type": "integer", "minimum": 1}, "mode": {"type": "integer", "minimum": 0}, "uid": {"type": "integer", "minimum": 0}, "gid": {"type": "integer", "minimum": 0}, "mtime_ns": {"type": "integer", "minimum": 0}, "ctime_ns": {"type": "integer", "minimum": 0}}
+        },
+        "sidecar_sha256": {
+          "type": "object", "additionalProperties": false,
+          "required": [".complete", "metadata.json", "manifest.json", "config.json"],
+          "properties": {".complete": {"$ref": "#/$defs/nullableSha256"}, "metadata.json": {"$ref": "#/$defs/nullableSha256"}, "manifest.json": {"$ref": "#/$defs/nullableSha256"}, "config.json": {"$ref": "#/$defs/nullableSha256"}}
+        },
+        "critical_file_sha256": {
+          "type": "object", "additionalProperties": false,
+          "required": ["bash", "python"], "properties": {"bash": {"$ref": "#/$defs/nullableSha256"}, "python": {"$ref": "#/$defs/nullableSha256"}}
+        },
+        "metadata_contract": {
+          "type": "object", "additionalProperties": false,
+          "required": ["resolved_digest", "manifest_sha256", "config_sha256", "bash_sha256", "regular_files", "bytes"],
+          "properties": {"resolved_digest": {"type": ["string", "null"]}, "manifest_sha256": {"$ref": "#/$defs/nullableSha256"}, "config_sha256": {"$ref": "#/$defs/nullableSha256"}, "bash_sha256": {"$ref": "#/$defs/nullableSha256"}, "regular_files": {"type": ["integer", "null"], "minimum": 0}, "bytes": {"type": ["integer", "null"], "minimum": 0}}
+        },
+        "valid": {"type": "boolean"}
+      }
+    },
+    "activeChecks": {
+      "type": "object", "additionalProperties": false,
+      "required": ["linux", "x86_64", "root_identity", "cgroup_v1_or_hybrid", "cpu_controller", "memory_controller", "pids_controller", "rootfs_identity", "supervisor", "python_wrapper", "fit_hook", "mount_tool", "unshare_tool", "artifact_lock", "artifact_install_inventory"],
+      "properties": {"linux": {"type": "boolean"}, "x86_64": {"type": "boolean"}, "root_identity": {"type": "boolean"}, "cgroup_v1_or_hybrid": {"type": "boolean"}, "cpu_controller": {"type": "boolean"}, "memory_controller": {"type": "boolean"}, "pids_controller": {"type": "boolean"}, "rootfs_identity": {"type": "boolean"}, "supervisor": {"type": "boolean"}, "python_wrapper": {"type": "boolean"}, "fit_hook": {"type": "boolean"}, "mount_tool": {"type": "boolean"}, "unshare_tool": {"type": "boolean"}, "artifact_lock": {"type": "boolean"}, "artifact_install_inventory": {"type": "boolean"}}
+    },
+    "activeVerification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "checks", "all_checks_pass", "admission_stamp_valid", "admission_stamp_digest", "boot_id", "rootfs_identity"],
+      "properties": {"schema": {"const": "openmle_fast_active_runtime_preflight_v1"}, "checks": {"$ref": "#/$defs/activeChecks"}, "all_checks_pass": {"type": "boolean"}, "admission_stamp_valid": {"type": "boolean"}, "admission_stamp_digest": {"$ref": "#/$defs/nullableSha256"}, "boot_id": {"type": "string", "minLength": 1}, "rootfs_identity": {"$ref": "#/$defs/rootfsIdentity"}}
+    },
+    "artifactIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["supervisor_sha256", "python_wrapper_sha256", "fit_hook_sha256", "artifact_lock_sha256", "artifact_lock_expected_sha256", "rootfs_tree_lock_sha256", "verification_wrapper_sha256", "install_bundle_sha256", "remote_cleanup_sha256", "build_bundle_sha256", "public_runner_sha256", "private_runner_sha256"],
+      "properties": {"supervisor_sha256": {"$ref": "#/$defs/nullableSha256"}, "python_wrapper_sha256": {"$ref": "#/$defs/nullableSha256"}, "fit_hook_sha256": {"$ref": "#/$defs/nullableSha256"}, "artifact_lock_sha256": {"$ref": "#/$defs/nullableSha256"}, "artifact_lock_expected_sha256": {"$ref": "#/$defs/nullableSha256"}, "rootfs_tree_lock_sha256": {"$ref": "#/$defs/nullableSha256"}, "verification_wrapper_sha256": {"$ref": "#/$defs/nullableSha256"}, "install_bundle_sha256": {"$ref": "#/$defs/nullableSha256"}, "remote_cleanup_sha256": {"$ref": "#/$defs/nullableSha256"}, "build_bundle_sha256": {"$ref": "#/$defs/nullableSha256"}, "public_runner_sha256": {"$ref": "#/$defs/nullableSha256"}, "private_runner_sha256": {"$ref": "#/$defs/nullableSha256"}}
+    },
+    "privateLimits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cpu_vcpus", "memory_bytes", "max_processes", "wall_ms", "input_bytes"],
+      "properties": {"cpu_vcpus": {"const": 1}, "memory_bytes": {"const": 2147483648}, "max_processes": {"const": 32}, "wall_ms": {"const": 7000}, "input_bytes": {"const": 67108864}}
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmle_fast_private_worker_result_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "classification", "native_score", "higher_is_better"],
+  "properties": {
+    "schema": {"const": "openmle_fast_private_worker_result_v1"},
+    "classification": {"enum": ["graded", "invalid_submission", "infrastructure_fault"]},
+    "native_score": {"type": ["number", "null"]},
+    "higher_is_better": {"type": "boolean"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["classification"],
+        "properties": {"classification": {"const": "graded"}}
+      },
+      "then": {"properties": {"native_score": {"type": "number"}}}
+    },
+    {
+      "if": {
+        "required": ["classification"],
+        "properties": {
+          "classification": {
+            "enum": ["invalid_submission", "infrastructure_fault"]
+          }
+        }
+      },
+      "then": {"properties": {"native_score": {"type": "null"}}}
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "schema_version": "swesmith_jsonl_manifest_v1",
+  "role": "train",
+  "upstream": {
+    "dataset_revision": "ea6d7173829c7ec8fa16c22055699ff2e9188091",
+    "repository": "SWE-bench/SWE-smith",
+    "revision": "ea6d7173829c7ec8fa16c22055699ff2e9188091",
+    "source_revision": "9b74ac08118a85c39c356802f7961893af73e07f"
+  },
+  "selection": {
+    "count": 3768,
+    "mode": "instance_ids",
+    "path": "train_ids.json",
+    "sha256": "929036028f104a30b850d098434eac91df5256bbdbf11e7ec789322cea8b7c5d"
+  },
+  "shards": [
+    {
+      "path": "shards/train-00000-of-00011.jsonl",
+      "physical_rows": 3696,
+      "sha256": "3c5696882f56067c6ddc702c9ee3f5cf46751e8c03ccf23520dd24e4d9b0dbd4",
+      "usable_rows": 2889
+    },
+    {
+      "path": "shards/train-00001-of-00011.jsonl",
+      "physical_rows": 3696,
+      "sha256": "3ac74f79de82ded7434a3f7a04fc9d7ff3dcd4d4222d2e6b6a1eda3188ee35b0",
+      "usable_rows": 2223
+    },
+    {
+      "path": "shards/train-00002-of-00011.jsonl",
+      "physical_rows": 3696,
+      "sha256": "30eabd51da76bd00d9701624d03f2f54c540f931f6982a5fe310937004eab113",
+      "usable_rows": 2694
+    },
+    {
+      "path": "shards/train-00003-of-00011.jsonl",
+      "physical_rows": 3696,
+      "sha256": "80c02617175c545d50cec5e812a9e6d224e1f2fc8b3d13891f413feaf95728f3",
+      "usable_rows": 2410
+    },
+    {
+      "path": "shards/train-00004-of-00011.jsonl",
+      "physical_rows": 3696,
+      "sha256": "b06b77c622e4ae1c68515227ddbc58f5d7dfa0288d29f7ec21800d428ebb1664",
+      "usable_rows": 2733
+    },
+    {
+      "path": "shards/train-00005-of-00011.jsonl",
+      "physical_rows": 3696,
+      "sha256": "3890059eab4af037a09bc33a80a0c20aaebcfc6ce818ebb571bb78d3d6c7d336",
+      "usable_rows": 3151
+    },
+    {
+      "path": "shards/train-00006-of-00011.jsonl",
+      "physical_rows": 7392,
+      "sha256": "154f66ce228c19fcf05cb7219c6bc9d0b80e176fcdf93d037f064dc74a156e2c",
+      "usable_rows": 5623
+    },
+    {
+      "path": "shards/train-00007-of-00011.jsonl",
+      "physical_rows": 7392,
+      "sha256": "3d4bd40b807ad1eeff730887765e9e201138598f53352494dce2f4aafbaa959f",
+      "usable_rows": 5928
+    },
+    {
+      "path": "shards/train-00008-of-00011.jsonl",
+      "physical_rows": 7392,
+      "sha256": "6ce12ddc00d0b0e9a1f188b9746fd32625b1c739428760772c4a6f87a159c918",
+      "usable_rows": 5128
+    },
+    {
+      "path": "shards/train-00009-of-00011.jsonl",
+      "physical_rows": 7392,
+      "sha256": "ed404f96c4d74a4923beb703d3ee9f258770db0b5ac8aa15b58dcdbed453d386",
+      "usable_rows": 6308
+    },
+    {
+      "path": "shards/train-00010-of-00011.jsonl",
+      "physical_rows": 7392,
+      "sha256": "40796113bd6e4ae145075eab01a561ffdb4ed9a4023c9743835a7ea68eb1a673",
+      "usable_rows": 2016
+    }
+  ],
+  "dataset_id": "camg-ii-coding-train"
+}
